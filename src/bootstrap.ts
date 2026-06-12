@@ -3,6 +3,7 @@ import { db } from "./db.js";
 import { ODDS_API_KEY, log } from "./config.js";
 import { bootstrapEvents, pollOdds } from "./sources/oddsapi.js";
 import { pollMatchGames, pollOutright } from "./sources/polymarket.js";
+import { pollKalshiMatches, pollKalshiOutright } from "./sources/kalshi.js";
 
 log("bootstrap: db schema ready");
 
@@ -15,6 +16,8 @@ if (ODDS_API_KEY) {
 
 await pollOutright();
 await pollMatchGames();
+await pollKalshiOutright();
+await pollKalshiMatches();
 
 const counts = db
   .prepare(

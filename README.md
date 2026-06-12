@@ -2,8 +2,8 @@
 
 2026 世界杯赔率聚合 dashboard(**纯个人自用**:只读聚合 + 分析,不下单、不对外发布)。
 
-当前状态:Phase A 基线已收口;采集、健康检查、当前赔率、体彩抓取/导入、避坑指数均可用,后台继续攒不可回填的赔率历史。
-体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。下一步推荐先做本地只读 mini dashboard,AI/Kalshi 后置。
+当前状态:Phase A 基线已收口,Kalshi 已接入 daemon 轮询;采集、健康检查、当前赔率、体彩抓取/导入、避坑指数均可用,后台继续攒不可回填的赔率历史。
+体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。下一步:决策 dashboard + AI 分析面板。
 
 ## 快速开始
 
@@ -25,6 +25,7 @@ tail -F logs/daemon.log
 
 - SQLite 本地库: `event / market / outcome / snapshot / meta`,snapshot 只追加;`event.fixture_key` 用于跨源合并同一场比赛。
 - Polymarket:daemon 默认 5min 抓冠军盘 + 单场主三元;严格过滤 `fifwc-{home}-{away}-{date}` 主事件,跳过 props/半场/比分等衍生盘。
+- Kalshi:daemon 默认 5min 抓冠军盘(`KXMENWORLDCUP-26`,48 队二元)+ 单场系列(`KXWCGAME`,两队+TIE 三个二元);公开行情接口无需鉴权,按队名+赛日挂到现有 fixture,不造孤立 event。
 - The Odds API:有 key 时按免费层约 90min 抓欧洲区 `h2h` 书商 1X2;配额写入 `meta`,由 `npm run status` 显示。
 - 体彩竞彩:用官方计算器公开 JSON 接口手动低频抓 `HAD`/`HHAD`;如果被 WAF 拦截,退回本地 CSV/JSON 导入。
 - 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Pinnacle / 体彩 HAD / 国际书商均值三向归一概率。
@@ -50,8 +51,8 @@ tail -F logs/daemon.log
 | 源 | 认证 | 频率 | 内容 |
 |---|---|---|---|
 | Polymarket Gamma | 无需 | 5min | 冠军盘(60 队二元)+ 单场主三元(series `soccer-fifwc` id=11433,每场 3 个 moneyline 二元:主胜/客胜/平局) |
+| Kalshi | 无需(公开行情) | 5min | 冠军盘 `KXMENWORLDCUP-26`(48 队二元)+ 单场 series `KXWCGAME`(每场两队+TIE 三个二元) |
 | The Odds API | key(免费 500/月) | 90min(免费层) | 书商 1X2,欧洲区;credit=市场数×地区数 |
-| Kalshi | — | — | Phase B |
 | 体彩竞彩 | 官方公开计算器接口/手工 CSV | 手动低频 | 胜平负 HAD + 让球胜平负 HHAD |
 
 ## 体彩接入
@@ -89,6 +90,7 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 - 三个二元价加总 ≈1.015(独立交易的 overround),三向归一(multiplicative)放读取层
 - 体彩官方接口返回中文队名;`teams.ts` 维护中文别名,用于合并到现有英文 fixture。
 - **launchd 不继承 shell 代理变量**:HTTPS_PROXY 必须写进 `.env`,大陆直连 gamma-api 高频 HTTP 000
+- Kalshi 价格字段已迁移为 `*_dollars` 字符串(`response_price_units=usd_cent`),旧整数 cent 字段不再返回;冠军盘 series `KXMWORLDCUP` 是空壳,正确的是 `KXMENWORLDCUP`;单场 API 不给精确 kickoff,按队名+赛日±1 天匹配现有 fixture。
 
 ## 设计要点(来源:三模型讨论,raw 在 sui-research/sources/raw/wc26-*-2026-06-12.md)
 
@@ -101,8 +103,9 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 ## 后续阶段
 
 - Phase A 观测:跑满 24h 增长验证,按 unmatched/health 输出继续补队名别名和源覆盖。这是剩余观测项,不是功能缺口。
-- Phase B mini dashboard(推荐下一步):本地只读页面展示 `current` + `avoid:sporttery` + `health`,先不接 AI、不接 Kalshi。
-- Phase B 后续:UI 详情页、Kalshi、devig/价差/line move、AI prompt 窗口。
+- ~~Kalshi 接入~~:已完成(冠军盘 + 单场,daemon 5min)。
+- Phase B 决策 dashboard(进行中):本地只读页面,比赛卡片流(共识概率条 + 体彩 diff 着色 + 走势 sparkline)、避坑/划算榜、夺冠 Top10(PM vs Kalshi)、health 摘要。
+- Phase B AI 分析面板:单场数据组装(~1.5k tokens 高密度上下文)、prompt 透明可编辑、Claude API 调用、分析历史落库。
 - Phase C:HHAD 视图、可选告警。
 
 ## 交接检查清单

@@ -3,11 +3,14 @@
 import { log } from "./config.js";
 import { pollOdds } from "./sources/oddsapi.js";
 import { pollOutright, pollMatchGames } from "./sources/polymarket.js";
+import { pollKalshiOutright, pollKalshiMatches } from "./sources/kalshi.js";
 
 const results: string[] = [];
 for (const [name, fn] of [
   ["polymarket/outright", pollOutright],
   ["polymarket/games", pollMatchGames],
+  ["kalshi/outright", pollKalshiOutright],
+  ["kalshi/games", pollKalshiMatches],
   ["oddsapi/h2h", pollOdds],
 ] as const) {
   try {

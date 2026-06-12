@@ -10,6 +10,7 @@ const rows = getCurrentOdds(parseLimit()).map((row) => ({
   kickoff_utc: row.kickoffUtc,
   match: row.match,
   polymarket: formatThreeWay(row.polymarket),
+  kalshi: formatThreeWay(row.kalshi),
   pinnacle: formatThreeWay(row.pinnacle),
   sporttery: formatThreeWay(row.sporttery),
   book_avg: formatThreeWay(row.bookAvg),

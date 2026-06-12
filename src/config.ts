@@ -33,6 +33,12 @@ export const GAMMA_BASE = "https://gamma-api.polymarket.com";
 export const PM_OUTRIGHT_SLUG = "world-cup-winner";
 export const PM_OUTRIGHT_ID = "30615"; // slug 查询偶发空响应时的兜底
 
+// Kalshi 公开行情 API,行情读取无需鉴权
+export const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
+export const KALSHI_OUTRIGHT_EVENT = "KXMENWORLDCUP-26"; // 2026 Men's World Cup Winner(48 队二元)
+export const KALSHI_GAME_SERIES = "KXWCGAME"; // 单场系列,每场 3 个二元市场(两队 + TIE)
+export const KALSHI_POLL_MS = Number(process.env.KALSHI_POLL_MS || 5 * 60 * 1000);
+
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }

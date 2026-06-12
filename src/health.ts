@@ -1,4 +1,4 @@
-import { ODDS_API_KEY, ODDSAPI_POLL_MS, PM_POLL_MS } from "./config.js";
+import { KALSHI_POLL_MS, ODDS_API_KEY, ODDSAPI_POLL_MS, PM_POLL_MS } from "./config.js";
 import { db, getMeta } from "./db.js";
 
 type Level = "pass" | "warn" | "fail";
@@ -128,6 +128,18 @@ if (!ODDS_API_KEY) {
   add(checks, "warn", `Odds API last call is stale: latest=${oddsLast} age=${fmtAge(oddsAge)}`);
 } else {
   add(checks, "pass", `Odds API last call=${oddsLast} age=${fmtAge(oddsAge)}`);
+}
+
+// Kalshi 是观察期新源:stale 给 warn 不给 fail,避免链路抖动误报
+const kalshiLast = getMeta("kalshi_last_call");
+const kalshiAge = ageMs(kalshiLast);
+const kalshiStaleMs = Math.max(KALSHI_POLL_MS * 3, 15 * 60 * 1000);
+if (!kalshiLast || kalshiAge === null) {
+  add(checks, "warn", "kalshi has not been polled yet");
+} else if (kalshiAge > kalshiStaleMs) {
+  add(checks, "warn", `kalshi last poll is stale: latest=${kalshiLast} age=${fmtAge(kalshiAge)}`);
+} else {
+  add(checks, "pass", `kalshi last poll=${kalshiLast} age=${fmtAge(kalshiAge)}`);
 }
 
 const sportteryLast = getMeta("sporttery_last_call");

@@ -11,6 +11,7 @@ export interface CurrentOddsRow {
   awayTeam: string;
   sourceOdds: Record<string, ThreeWay>;
   polymarket: ThreeWay | null;
+  kalshi: ThreeWay | null;
   pinnacle: ThreeWay | null;
   sporttery: ThreeWay | null;
   bookAvg: ThreeWay | null;
@@ -110,8 +111,9 @@ export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
       if (threeWay) normalized.set(source, threeWay);
     }
 
+    // book_avg 只取传统书商;预测市场(PM/Kalshi)与体彩单列
     const bookRows = [...normalized.entries()]
-      .filter(([source]) => source !== "polymarket" && source !== "sporttery")
+      .filter(([source]) => source !== "polymarket" && source !== "kalshi" && source !== "sporttery")
       .map(([, probs]) => probs);
 
     return {
@@ -122,6 +124,7 @@ export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
       awayTeam: fixture.away_team,
       sourceOdds: Object.fromEntries(normalized) as Record<string, ThreeWay>,
       polymarket: normalized.get("polymarket") ?? null,
+      kalshi: normalized.get("kalshi") ?? null,
       pinnacle: normalized.get("pinnacle") ?? null,
       sporttery: normalized.get("sporttery") ?? null,
       bookAvg: averageThreeWay(bookRows),
