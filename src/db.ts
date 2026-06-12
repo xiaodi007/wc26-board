@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS ai_analysis (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fixture_key TEXT NOT NULL,
+  ts TEXT DEFAULT (datetime('now')),
+  model TEXT,
+  system_prompt TEXT,
+  user_prompt TEXT NOT NULL,
+  response TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_fixture ON ai_analysis(fixture_key, ts);
 `;
 
 export const db = new Database(DB_PATH);
@@ -156,4 +166,29 @@ export function setMeta(key: string, value: string): void {
 export function getMeta(key: string): string | null {
   const row = stmtGetMeta.get(key) as { value: string } | undefined;
   return row ? row.value : null;
+}
+
+export interface AiAnalysisRow {
+  id: number;
+  fixture_key: string;
+  ts: string;
+  model: string | null;
+  system_prompt: string | null;
+  user_prompt: string;
+  response: string;
+}
+
+const stmtInsertAnalysis = db.prepare(
+  `INSERT INTO ai_analysis (fixture_key, model, system_prompt, user_prompt, response) VALUES (?, ?, ?, ?, ?)`
+);
+const stmtListAnalyses = db.prepare(
+  `SELECT * FROM ai_analysis WHERE fixture_key=? ORDER BY ts DESC, id DESC LIMIT ?`
+);
+
+export function insertAnalysis(fixtureKey: string, model: string, systemPrompt: string, userPrompt: string, response: string): number {
+  return Number(stmtInsertAnalysis.run(fixtureKey, model, systemPrompt, userPrompt, response).lastInsertRowid);
+}
+
+export function listAnalyses(fixtureKey: string, limit = 5): AiAnalysisRow[] {
+  return stmtListAnalyses.all(fixtureKey, Math.min(Math.max(limit, 1), 20)) as AiAnalysisRow[];
 }

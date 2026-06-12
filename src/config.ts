@@ -42,6 +42,11 @@ export const KALSHI_POLL_MS = Number(process.env.KALSHI_POLL_MS || 5 * 60 * 1000
 // 本地只读 board,只绑 127.0.0.1。PORT 兜底兼容 IDE preview 注入的端口
 export const BOARD_PORT = Number(process.env.BOARD_PORT || process.env.PORT || 4626);
 
+// AI 分析面板。无 key 时面板降级为 prompt 预览 + 复制(粘贴到任意 AI 用)
+export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+export const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+export const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
+
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }

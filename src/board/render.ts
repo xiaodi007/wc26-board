@@ -7,6 +7,9 @@ import { getOutrightBoard } from "../queries/outright.js";
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
 import { getSportteryHhad } from "../queries/hhad.js";
+import { buildMatchContext } from "../ai/context.js";
+import { currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
+import { listAnalyses, type AiAnalysisRow } from "../db.js";
 import { zhTeamName } from "../teams.js";
 import { lineChart, sparkline, type ChartSeries } from "./svg.js";
 
@@ -119,6 +122,10 @@ summary{cursor:pointer;color:var(--dim)}
 .legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:4px}
 footer{margin-top:40px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
 .hl td{background:rgba(240,180,41,.06)}
+.btn{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 14px;font-size:13px;cursor:pointer}
+.btn:hover{border-color:#3a4254}
+.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+.btn:disabled{opacity:.5;cursor:wait}
 </style>
 </head>
 <body>
@@ -128,7 +135,12 @@ ${body}
 <script>
 (function(){
   var y=sessionStorage.getItem("y"); if(y) window.scrollTo(0, Number(y));
-  setTimeout(function(){ sessionStorage.setItem("y", String(window.scrollY)); location.reload(); }, ${autoRefreshSec * 1000});
+  function tick(){
+    if (window.__busy) { setTimeout(tick, 15000); return; } // AI 生成中不打断
+    sessionStorage.setItem("y", String(window.scrollY));
+    location.reload();
+  }
+  setTimeout(tick, ${autoRefreshSec * 1000});
 })();
 </script>
 </body>
@@ -405,6 +417,106 @@ function hhadSection(fixtureKey: string, row: CurrentOddsRow): string {
   );
 }
 
+// ---------- AI 分析面板 ----------
+
+const LEAN_ZH: Record<AnalysisVerdict["lean"], string> = { home: "主胜", draw: "平局", away: "客胜", no_bet: "不下注" };
+const CONF_ZH: Record<AnalysisVerdict["confidence"], string> = { low: "低", medium: "中", high: "高" };
+
+function verdictCard(row: CurrentOddsRow, analysis: AiAnalysisRow): string {
+  let verdict: AnalysisVerdict | null = null;
+  try {
+    verdict = JSON.parse(analysis.response) as AnalysisVerdict;
+  } catch {
+    /* 解析失败(refusal/截断)走 raw 展示 */
+  }
+  const meta = `<div class="dim" style="font-size:11px;margin-top:8px">#${analysis.id} · ${esc(analysis.model ?? "?")} · ${esc(bjFull.format(new Date(analysis.ts + "Z")))}</div>`;
+  if (!verdict || !verdict.lean) {
+    return `<div class="panel" style="margin-bottom:10px"><div class="dim">原始输出(未能解析为结构化结论):</div><pre style="white-space:pre-wrap;font-size:12px">${esc(analysis.response.slice(0, 2000))}</pre>${meta}</div>`;
+  }
+  const leanTeam =
+    verdict.lean === "home" ? `(${teamZh(row.homeTeam)})` : verdict.lean === "away" ? `(${teamZh(row.awayTeam)})` : "";
+  const leanColor = verdict.lean === "no_bet" ? "var(--dim)" : "var(--amber)";
+  const list = (items: string[]): string => items.map((s) => `<li>${esc(s)}</li>`).join("");
+  return (
+    `<div class="panel" style="margin-bottom:10px">` +
+    `<div style="font-size:15px"><b style="color:${leanColor}">倾向:${LEAN_ZH[verdict.lean]}${esc(leanTeam)}</b>` +
+    `<span class="chip" style="margin-left:10px">信心 <b>${CONF_ZH[verdict.confidence] ?? esc(String(verdict.confidence))}</b></span></div>` +
+    `<p style="margin:8px 0">${esc(verdict.summary_zh ?? "")}</p>` +
+    `<div class="grid2"><div><div class="dim" style="font-size:12px">关键信号</div><ul style="margin:4px 0;padding-left:18px;font-size:13px">${list(verdict.key_signals ?? [])}</ul></div>` +
+    `<div><div class="dim" style="font-size:12px">风险</div><ul style="margin:4px 0;padding-left:18px;font-size:13px">${list(verdict.risks ?? [])}</ul></div></div>` +
+    `<div style="margin-top:6px;font-size:13px"><span class="dim">体彩视角:</span>${esc(verdict.sporttery_take ?? "")}</div>` +
+    meta +
+    `</div>`
+  );
+}
+
+function aiSection(fixtureKey: string, row: CurrentOddsRow): string {
+  const context = buildMatchContext(fixtureKey);
+  const systemPrompt = currentSystemPrompt();
+  const keyReady = hasApiKey();
+  const history = listAnalyses(fixtureKey, 5);
+
+  const historyHtml = history.length
+    ? history.map((a) => verdictCard(row, a)).join("")
+    : `<p class="dim">还没有分析记录。</p>`;
+
+  const promptBlock = context
+    ? `<details style="margin-bottom:10px"><summary>查看/编辑 prompt(系统模板 + 数据上下文)</summary>` +
+      `<div class="panel" style="margin-top:8px">` +
+      `<div class="dim" style="font-size:12px;margin-bottom:4px">系统模板(可编辑,存本地库,对所有比赛生效)</div>` +
+      `<textarea id="ai-system" style="width:100%;min-height:160px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:12px;font-family:inherit">${esc(systemPrompt)}</textarea>` +
+      `<div style="margin:6px 0 12px"><button onclick="aiSaveTemplate()" class="btn">保存模板</button> <button onclick="aiResetTemplate()" class="btn">恢复默认</button> <span id="ai-tpl-status" class="dim" style="font-size:12px"></span></div>` +
+      `<div class="dim" style="font-size:12px;margin-bottom:4px">数据上下文(自动组装,只读;~${Math.round(context.prompt.length / 3)} tokens 量级)</div>` +
+      `<pre id="ai-context" style="white-space:pre-wrap;font-size:12px;max-height:300px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px">${esc(context.prompt)}</pre>` +
+      `<button onclick="aiCopyPrompt()" class="btn">复制完整 prompt</button> <span class="dim" style="font-size:12px">没有 API key 时可粘贴到任意 AI 使用</span>` +
+      `</div></details>`
+    : `<p class="dim">无法组装上下文(比赛可能已开赛)。</p>`;
+
+  const button = context
+    ? keyReady
+      ? `<button id="ai-go" onclick="aiAnalyze()" class="btn primary">生成分析</button> <span id="ai-status" class="dim" style="font-size:12px"></span>`
+      : `<span class="dim">未配置 ANTHROPIC_API_KEY(写入 .env 后重启 board 即可一键生成);先用上方「复制完整 prompt」。</span>`
+    : "";
+
+  return (
+    `<section id="ai"><h2>AI 分析 <small>结构化解读盘面信号;个人参考,不构成投注建议</small></h2>` +
+    promptBlock +
+    `<div style="margin-bottom:10px">${button}</div>` +
+    `<div id="ai-history">${historyHtml}</div>` +
+    `<script>
+function aiBusy(b){ window.__busy = b; var btn=document.getElementById("ai-go"); if(btn) btn.disabled=b; }
+async function aiAnalyze(){
+  aiBusy(true);
+  var s=document.getElementById("ai-status"); s.textContent="分析中…(通常 10-30 秒)";
+  try {
+    var res = await fetch("/api/analyze?fk=" + encodeURIComponent(${JSON.stringify(fixtureKey)}), {method:"POST"});
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.message || data.error || res.status);
+    s.textContent = "完成,刷新中…";
+    sessionStorage.setItem("y", String(window.scrollY));
+    location.reload();
+  } catch(e) { s.textContent = "失败: " + e.message; aiBusy(false); }
+}
+async function aiSaveTemplate(){
+  var t=document.getElementById("ai-system").value;
+  var st=document.getElementById("ai-tpl-status");
+  var res=await fetch("/api/template",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({template:t})});
+  st.textContent = res.ok ? "已保存" : "保存失败";
+}
+async function aiResetTemplate(){
+  var st=document.getElementById("ai-tpl-status");
+  var res=await fetch("/api/template",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({reset:true})});
+  if(res.ok){ var d=await res.json(); document.getElementById("ai-system").value=d.template; st.textContent="已恢复默认"; }
+}
+function aiCopyPrompt(){
+  var full=document.getElementById("ai-system").value + "\\n\\n---\\n\\n" + document.getElementById("ai-context").textContent;
+  navigator.clipboard.writeText(full).then(function(){ document.getElementById("ai-tpl-status").textContent="已复制"; });
+}
+</script>` +
+    `</section>`
+  );
+}
+
 export function matchPage(fixtureKey: string): string {
   const row = getCurrentOdds(70).find((r) => r.fixtureKey === fixtureKey);
   if (!row) {
@@ -422,12 +534,12 @@ export function matchPage(fixtureKey: string): string {
     `<header class="top"><h1><a href="/">← WC26 Board</a></h1>${freshnessChips()}</header>` +
     `<h2 style="font-size:20px;margin-top:6px">${esc(matchZh(row))} <small>${esc(row.match)}</small></h2>` +
     `<p class="dim">开球:${esc(bjFull.format(kickoff))}(北京) · ${esc(row.kickoffUtc)} · ${countdown}</p>` +
+    aiSection(fixtureKey, row) +
     `<h2>各源三向归一概率 <small>diff 相对书商中位,红=偏高(避坑)、绿=偏低(划算)</small></h2>` +
     `<div class="panel">${sourceTable(row)}</div>` +
     hhadSection(fixtureKey, row) +
     `<h2>48h 概率走势 <small>15min 降采样,三向归一;体彩为离散点</small></h2>` +
     `<div class="panel">${historyCharts(fixtureKey)}</div>` +
-    `<section id="ai"><h2>AI 分析 <small>即将上线:数据组装 + prompt 透明 + 结构化结论</small></h2><div class="panel dim">下一步接入。</div></section>` +
     `<footer>纯本地只读聚合,个人参考,不构成投注建议。</footer>`;
 
   return page(`${matchZh(row)} · WC26`, body, 120);

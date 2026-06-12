@@ -2,8 +2,8 @@
 
 2026 世界杯赔率聚合 dashboard(**纯个人自用**:只读聚合 + 分析,不下单、不对外发布)。
 
-当前状态:Phase A 基线已收口,Kalshi 已接入 daemon 轮询;采集、健康检查、当前赔率、体彩抓取/导入、避坑指数均可用,后台继续攒不可回填的赔率历史。
-体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。下一步:决策 dashboard + AI 分析面板。
+当前状态:Phase B 完成 — Kalshi 已进 daemon 轮询,决策 board(`npm run board`)与 AI 分析面板可用;采集、健康检查、当前赔率、体彩抓取/导入、避坑指数均正常,后台继续攒不可回填的赔率历史。
+体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析需在 `.env` 配 `ANTHROPIC_API_KEY`(不配则降级为 prompt 预览+复制)。
 
 ## 快速开始
 
@@ -29,8 +29,10 @@ tail -F logs/daemon.log
 - Kalshi:daemon 默认 5min 抓冠军盘(`KXMENWORLDCUP-26`,48 队二元)+ 单场系列(`KXWCGAME`,两队+TIE 三个二元);公开行情接口无需鉴权,按队名+赛日挂到现有 fixture,不造孤立 event。
 - The Odds API:有 key 时按免费层约 90min 抓欧洲区 `h2h` 书商 1X2;配额写入 `meta`,由 `npm run status` 显示。
 - 体彩竞彩:用官方计算器公开 JSON 接口手动低频抓 `HAD`/`HHAD`;如果被 WAF 拦截,退回本地 CSV/JSON 导入。
-- 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Pinnacle / 体彩 HAD / 国际书商均值三向归一概率。
-- 避坑指数: `npm run avoid:sporttery` 输出体彩 HAD 隐含概率高于国际书商均值的选项,用于识别相对不划算方向,不是投注建议。
+- 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Kalshi / Pinnacle / 体彩 HAD / 书商中位三向归一概率。
+- 避坑指数: `npm run avoid:sporttery` 输出体彩 HAD 隐含概率高于国际书商共识的选项,用于识别相对不划算方向,不是投注建议。
+- 决策 board: `npm run board` 起本地只读页面(127.0.0.1:4626)——比赛卡片流(共识条+体彩 diff 着色+sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi)、详情页全源表+48h 走势+HHAD。
+- AI 分析: 详情页一键生成结构化解读(倾向/信号/风险/体彩视角),prompt 透明可编辑,分析历史落库;数据组装为 ~1.5k tokens 高密度上下文(归一概率、预计算价差、关键点走势、夺冠锚、新鲜度)。
 
 ## 命令
 
@@ -107,8 +109,8 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 - Phase A 观测:跑满 24h 增长验证,按 unmatched/health 输出继续补队名别名和源覆盖。这是剩余观测项,不是功能缺口。
 - ~~Kalshi 接入~~:已完成(冠军盘 + 单场,daemon 5min)。
 - ~~Phase B 决策 dashboard~~:已完成(`npm run board`):比赛卡片流(共识条 + 体彩 diff 着色 + sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi 互证)、详情页全源表 + 48h 三向走势 + HHAD、health 摘要;书商共识用中位数抗离群。
-- Phase B AI 分析面板:单场数据组装(~1.5k tokens 高密度上下文)、prompt 透明可编辑、Claude API 调用、分析历史落库。
-- Phase C:HHAD 视图、可选告警。
+- ~~Phase B AI 分析面板~~:已完成:`src/ai/context.ts` 组装高密度上下文,`src/ai/analyze.ts` 调 Claude(结构化输出 json_schema,默认 `claude-sonnet-4-6`,`.env` 可覆盖),结果落 `ai_analysis` 表;模板存 meta 可在页面编辑;无 key 降级为复制 prompt。**待办:配 `ANTHROPIC_API_KEY` 后跑一次真实调用验证。**
+- Phase C:HHAD 让球视图进 board、可选告警(突变/避坑阈值触发)、AI 批量分析当日场次。
 
 ## 交接检查清单
 
