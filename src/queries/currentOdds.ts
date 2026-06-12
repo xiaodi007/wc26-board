@@ -59,6 +59,22 @@ export function averageThreeWay(rows: ThreeWay[]): ThreeWay | null {
   };
 }
 
+// 书商共识用中位数:单家离群/过期盘(实测 marathonbet 出现过 ±37pp 异常)不拖偏共识
+export function medianThreeWay(rows: ThreeWay[]): ThreeWay | null {
+  if (rows.length === 0) return null;
+  const med = (values: number[]): number => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  };
+  // 每向取中位后加总未必为 1,再归一
+  return normalizeThreeWay({
+    home: med(rows.map((row) => row.home)),
+    draw: med(rows.map((row) => row.draw)),
+    away: med(rows.map((row) => row.away)),
+  });
+}
+
 export function formatThreeWay(row: ThreeWay | null): string {
   if (!row) return "-";
   return LABELS.map((label) => `${(row[label] * 100).toFixed(1)}%`).join(" / ");
@@ -127,7 +143,7 @@ export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
       kalshi: normalized.get("kalshi") ?? null,
       pinnacle: normalized.get("pinnacle") ?? null,
       sporttery: normalized.get("sporttery") ?? null,
-      bookAvg: averageThreeWay(bookRows),
+      bookAvg: medianThreeWay(bookRows),
       books: bookRows.length,
     };
   });

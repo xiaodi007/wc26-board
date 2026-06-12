@@ -1,4 +1,4 @@
-import { getCurrentOdds, LABELS, type Label } from "./currentOdds.js";
+import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label } from "./currentOdds.js";
 
 export interface SportteryAvoidanceRow {
   kickoffUtc: string;
@@ -9,6 +9,47 @@ export interface SportteryAvoidanceRow {
   diffPp: number;
   books: number;
   note: string;
+}
+
+// 双向价差视图:avoid = 体彩隐含概率显著高于国际共识(回报相对差);
+// value = 显著低于(体彩赔率相对国际盘偏高)。都是相对信号,不是建议。
+export interface SportteryEdges {
+  avoid: SportteryAvoidanceRow[];
+  value: SportteryAvoidanceRow[];
+}
+
+export function getSportteryEdges(
+  fixtures: CurrentOddsRow[],
+  options: { thresholdPp?: number; minBooks?: number } = {}
+): SportteryEdges {
+  const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : 2;
+  const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : 5;
+
+  const avoid: SportteryAvoidanceRow[] = [];
+  const value: SportteryAvoidanceRow[] = [];
+  for (const fixture of fixtures) {
+    if (!fixture.sporttery || !fixture.bookAvg || fixture.books < minBooks) continue;
+    for (const label of LABELS) {
+      const sporttery = fixture.sporttery[label];
+      const bookAvg = fixture.bookAvg[label];
+      const diffPp = (sporttery - bookAvg) * 100;
+      if (Math.abs(diffPp) < thresholdPp) continue;
+      const row: SportteryAvoidanceRow = {
+        kickoffUtc: fixture.kickoffUtc,
+        match: fixture.match,
+        outcome: outcomeName(label, fixture.homeTeam, fixture.awayTeam),
+        sporttery,
+        bookAvg,
+        diffPp,
+        books: fixture.books,
+        note: diffPp > 0 ? "体彩隐含概率偏高,回报相对不划算" : "体彩隐含概率偏低,赔率相对国际盘偏高",
+      };
+      (diffPp > 0 ? avoid : value).push(row);
+    }
+  }
+  avoid.sort((a, b) => b.diffPp - a.diffPp);
+  value.sort((a, b) => a.diffPp - b.diffPp);
+  return { avoid, value };
 }
 
 export interface SportteryAvoidanceOptions {
@@ -34,26 +75,5 @@ export function getSportteryAvoidance(options: SportteryAvoidanceOptions = {}): 
   const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : 2;
   const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : 5;
 
-  const rows: SportteryAvoidanceRow[] = [];
-  for (const fixture of getCurrentOdds(scanLimit)) {
-    if (!fixture.sporttery || !fixture.bookAvg || fixture.books < minBooks) continue;
-    for (const label of LABELS) {
-      const sporttery = fixture.sporttery[label];
-      const bookAvg = fixture.bookAvg[label];
-      const diffPp = (sporttery - bookAvg) * 100;
-      if (diffPp < thresholdPp) continue;
-      rows.push({
-        kickoffUtc: fixture.kickoffUtc,
-        match: fixture.match,
-        outcome: outcomeName(label, fixture.homeTeam, fixture.awayTeam),
-        sporttery,
-        bookAvg,
-        diffPp,
-        books: fixture.books,
-        note: "体彩隐含概率偏高,回报相对不划算",
-      });
-    }
-  }
-
-  return rows.sort((a, b) => b.diffPp - a.diffPp).slice(0, outputLimit);
+  return getSportteryEdges(getCurrentOdds(scanLimit), { thresholdPp, minBooks }).avoid.slice(0, outputLimit);
 }

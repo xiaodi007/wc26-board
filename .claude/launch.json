@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "board",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "board"],
+      "port": 4626,
+      "autoPort": true
+    }
+  ]
+}

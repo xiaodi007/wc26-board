@@ -14,6 +14,7 @@ npm run bootstrap           # 建库 + 赛程导入 + 首轮快照
 npm run status              # 体检
 npm run health              # Phase A 健康检查(失败时非 0 exit)
 npm run current             # 查看下一批比赛的三向归一概率(home/draw/away)
+npm run board               # 决策 board: http://127.0.0.1:4626(卡片流+避坑榜+夺冠+走势)
 npm run avoid:sporttery     # 体彩相对国际盘概率偏高的避坑排行
 npm run fetch:sporttery     # 低频手动抓取中国竞彩 HAD/HHAD
 npm run import:sporttery -- data/imports/sporttery.csv # 半自动导入竞彩胜平负 SP
@@ -39,6 +40,7 @@ tail -F logs/daemon.log
 | `npm run poll` | 手动跑一轮 Polymarket/OddsAPI 采集 |
 | `npm run daemon` | 前台跑常驻采集进程 |
 | `bash bin/install-launchd.sh` | 安装 macOS launchd KeepAlive daemon |
+| `npm run board` | 本地只读决策 board(默认 http://127.0.0.1:4626) |
 | `npm run status` | 查看事件/fixture 数、各源快照量、最新时间、API 配额 |
 | `npm run health` | Phase A 健康检查:fixture key、覆盖率、PM 延迟、OddsAPI/体彩新鲜度 |
 | `npm run current -- --limit=8` | 查看当前三向归一概率(home/draw/away) |
@@ -77,7 +79,7 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 
 ## 体彩避坑指数
 
-`npm run avoid:sporttery -- --limit=20 --threshold=2` 只读本地库,比较体彩 HAD 三向归一概率与国际书商均值(`book_avg`)。
+`npm run avoid:sporttery -- --limit=20 --threshold=2` 只读本地库,比较体彩 HAD 三向归一概率与国际书商共识(`book_avg`,自 Phase B 起为**中位数**——实测单家书商会出现 ±37pp 的离群/过期盘,均值会被拖偏)。
 
 - `diff_pp = (sporttery_prob - book_avg_prob) * 100`
 - 默认只显示 `diff_pp >= 2.0` 且国际书商数 `books >= 5` 的选项。
@@ -104,7 +106,7 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 
 - Phase A 观测:跑满 24h 增长验证,按 unmatched/health 输出继续补队名别名和源覆盖。这是剩余观测项,不是功能缺口。
 - ~~Kalshi 接入~~:已完成(冠军盘 + 单场,daemon 5min)。
-- Phase B 决策 dashboard(进行中):本地只读页面,比赛卡片流(共识概率条 + 体彩 diff 着色 + 走势 sparkline)、避坑/划算榜、夺冠 Top10(PM vs Kalshi)、health 摘要。
+- ~~Phase B 决策 dashboard~~:已完成(`npm run board`):比赛卡片流(共识条 + 体彩 diff 着色 + sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi 互证)、详情页全源表 + 48h 三向走势 + HHAD、health 摘要;书商共识用中位数抗离群。
 - Phase B AI 分析面板:单场数据组装(~1.5k tokens 高密度上下文)、prompt 透明可编辑、Claude API 调用、分析历史落库。
 - Phase C:HHAD 视图、可选告警。
 

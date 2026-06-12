@@ -87,6 +87,16 @@ export function normalizeTeam(name: string): string {
   return ALIASES[n] ?? n;
 }
 
+// 英文队名 → 中文展示名(取别名表里第一个中文别名;dashboard 用)
+const ZH_BY_CANONICAL: Record<string, string> = {};
+for (const [alias, canonical] of Object.entries(ALIASES)) {
+  if (/[一-鿿]/.test(alias) && !(canonical in ZH_BY_CANONICAL)) ZH_BY_CANONICAL[canonical] = alias;
+}
+
+export function zhTeamName(name: string): string | null {
+  return ZH_BY_CANONICAL[normalizeTeam(name)] ?? null;
+}
+
 export function teamsMatch(a: string, b: string): boolean {
   const na = normalizeTeam(a);
   const nb = normalizeTeam(b);

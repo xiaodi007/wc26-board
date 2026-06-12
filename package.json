@@ -9,6 +9,7 @@
     "daemon": "tsx src/daemon.ts",
     "status": "tsx src/status.ts",
     "health": "tsx src/health.ts",
+    "board": "tsx src/server.ts",
     "current": "tsx src/current.ts",
     "avoid:sporttery": "tsx src/avoidSporttery.ts",
     "import:sporttery": "tsx src/importSporttery.ts",
