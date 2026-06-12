@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { DB_PATH } from "./config.js";
+import { fixtureKey } from "./fixtures.js";
 
 // schema 来源: deepseek-pro 设计稿(sui-research/sources/raw/wc26-deepseek-2026-06-12.md §1.4)
 // snapshot 只追加;market/outcome 是维表;event_id 可空(冠军盘等赛事级市场不挂单场)
@@ -9,6 +10,7 @@ CREATE TABLE IF NOT EXISTS event (
   home_team TEXT NOT NULL,
   away_team TEXT NOT NULL,
   kickoff_utc TEXT NOT NULL,
+  fixture_key TEXT,
   status TEXT DEFAULT 'scheduled',
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -50,9 +52,35 @@ export const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.exec(SCHEMA);
 
+function ensureColumn(table: string, column: string, definition: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn("event", "fixture_key", "TEXT");
+db.exec("CREATE INDEX IF NOT EXISTS idx_event_fixture_key ON event(fixture_key)");
+
+const stmtBackfillFixtureKey = db.prepare(`UPDATE event SET fixture_key=? WHERE id=?`);
+const eventsMissingFixtureKey = db
+  .prepare(`SELECT id, home_team, away_team, kickoff_utc FROM event WHERE fixture_key IS NULL OR fixture_key=''`)
+  .all() as { id: string; home_team: string; away_team: string; kickoff_utc: string }[];
+const backfillFixtureKeys = db.transaction(() => {
+  for (const ev of eventsMissingFixtureKey) {
+    stmtBackfillFixtureKey.run(fixtureKey(ev.home_team, ev.away_team, ev.kickoff_utc), ev.id);
+  }
+});
+backfillFixtureKeys();
+
 const stmtUpsertEvent = db.prepare(
-  `INSERT INTO event (id, home_team, away_team, kickoff_utc, status) VALUES (?, ?, ?, ?, ?)
-   ON CONFLICT(id) DO UPDATE SET kickoff_utc=excluded.kickoff_utc, status=excluded.status`
+  `INSERT INTO event (id, home_team, away_team, kickoff_utc, fixture_key, status) VALUES (?, ?, ?, ?, ?, ?)
+   ON CONFLICT(id) DO UPDATE SET
+     home_team=excluded.home_team,
+     away_team=excluded.away_team,
+     kickoff_utc=excluded.kickoff_utc,
+     fixture_key=excluded.fixture_key,
+     status=excluded.status`
 );
 const stmtFindMarket = db.prepare(`SELECT id FROM market WHERE source=? AND source_market_id=?`);
 const stmtInsertMarket = db.prepare(
@@ -70,7 +98,7 @@ const stmtSetMeta = db.prepare(
 const stmtGetMeta = db.prepare(`SELECT value FROM meta WHERE key=?`);
 
 export function upsertEvent(id: string, home: string, away: string, kickoffUtc: string, status = "scheduled"): void {
-  stmtUpsertEvent.run(id, home, away, kickoffUtc, status);
+  stmtUpsertEvent.run(id, home, away, kickoffUtc, fixtureKey(home, away, kickoffUtc), status);
 }
 
 const marketCache = new Map<string, number>();

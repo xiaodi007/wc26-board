@@ -7,7 +7,12 @@
     "bootstrap": "tsx src/bootstrap.ts",
     "poll": "tsx src/poll.ts",
     "daemon": "tsx src/daemon.ts",
-    "status": "tsx src/status.ts"
+    "status": "tsx src/status.ts",
+    "health": "tsx src/health.ts",
+    "current": "tsx src/current.ts",
+    "avoid:sporttery": "tsx src/avoidSporttery.ts",
+    "import:sporttery": "tsx src/importSporttery.ts",
+    "fetch:sporttery": "tsx src/fetchSporttery.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",

@@ -3,6 +3,52 @@
 // 别名表按 unmatched 日志增量补,不预设完整 48 队清单(避免硬编码错误)。
 
 const ALIASES: Record<string, string> = {
+  "加拿大": "canada",
+  "波黑": "bosnia and herzegovina",
+  "美国": "united states",
+  "巴拉圭": "paraguay",
+  "卡塔尔": "qatar",
+  "瑞士": "switzerland",
+  "巴西": "brazil",
+  "摩洛哥": "morocco",
+  "海地": "haiti",
+  "苏格兰": "scotland",
+  "澳大利亚": "australia",
+  "土耳其": "turkey",
+  "德国": "germany",
+  "库拉索": "curacao",
+  "荷兰": "netherlands",
+  "日本": "japan",
+  "科特迪瓦": "ivory coast",
+  "厄瓜多尔": "ecuador",
+  "瑞典": "sweden",
+  "突尼斯": "tunisia",
+  "西班牙": "spain",
+  "佛得角": "cape verde",
+  "比利时": "belgium",
+  "埃及": "egypt",
+  "沙特阿拉伯": "saudi arabia",
+  "乌拉圭": "uruguay",
+  "伊朗": "iran",
+  "新西兰": "new zealand",
+  "法国": "france",
+  "塞内加尔": "senegal",
+  "伊拉克": "iraq",
+  "挪威": "norway",
+  "阿根廷": "argentina",
+  "阿尔及利亚": "algeria",
+  "奥地利": "austria",
+  "约旦": "jordan",
+  "葡萄牙": "portugal",
+  "刚果(金)": "congo dr",
+  "刚果金": "congo dr",
+  "英格兰": "england",
+  "克罗地亚": "croatia",
+  "加纳": "ghana",
+  "巴拿马": "panama",
+  "乌兹别克斯坦": "uzbekistan",
+  "乌兹别克": "uzbekistan",
+  "哥伦比亚": "colombia",
   "usa": "united states",
   "us": "united states",
   "united states of america": "united states",
@@ -27,7 +73,9 @@ const ALIASES: Record<string, string> = {
 };
 
 export function normalizeTeam(name: string): string {
-  let n = name
+  const raw = name.toLowerCase().trim();
+  if (ALIASES[raw]) return ALIASES[raw];
+  let n = raw
     .toLowerCase()
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "") // 去音符 (Türkiye→Turkiye, Curaçao→Curacao)

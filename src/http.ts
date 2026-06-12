@@ -31,12 +31,13 @@ export async function fetchJson<T = unknown>(url: string, label?: string): Promi
 // 同上,但额外暴露响应头(The Odds API 的配额计数在头里)
 export async function fetchJsonWithHeaders<T = unknown>(
   url: string,
-  label?: string
+  label?: string,
+  headers?: HeadersInit
 ): Promise<{ data: T; headers: Headers }> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= RETRIES; attempt++) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const data = (await res.json()) as T;
       return { data, headers: res.headers };
