@@ -98,9 +98,10 @@ export function buildMatchContext(fixtureKey: string): MatchContext | null {
   const sections: string[] = [];
 
   // 1. 元信息
-  sections.push(
-    `## 比赛\n${matchZh}(${row.match})\n开球: ${bjFull.format(kickoff)} 北京时间(约 ${hoursTo.toFixed(1)} 小时后)`
-  );
+  const timing = row.live
+    ? `开球于 ${Math.round(-hoursTo * 60)} 分钟前 — 比赛进行中,体彩已停售,以下为盘中实时概率`
+    : `开球: ${bjFull.format(kickoff)} 北京时间(约 ${hoursTo.toFixed(1)} 小时后)`;
+  sections.push(`## 比赛\n${matchZh}(${row.match})\n${timing}`);
 
   // 2. 当前盘面
   const board: string[] = [];

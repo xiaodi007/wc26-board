@@ -6,6 +6,7 @@ export type ThreeWay = Record<Label, number>;
 export interface CurrentOddsRow {
   fixtureKey: string;
   kickoffUtc: string;
+  live: boolean; // 已开球且未过完赛窗口(约 2.5h);PM/Kalshi 盘中仍交易,体彩已停售
   match: string;
   homeTeam: string;
   awayTeam: string;
@@ -80,10 +81,13 @@ export function formatThreeWay(row: ThreeWay | null): string {
   return LABELS.map((label) => `${(row[label] * 100).toFixed(1)}%`).join(" / ");
 }
 
+// 窗口放宽到开球前 2.5h:进行中比赛不消失(盘中概率正是看点),完赛自然滑出
+const LIVE_WINDOW_H = 2.5;
+
 const fixturesStmt = db.prepare(
   `SELECT fixture_key, MIN(home_team) AS home_team, MIN(away_team) AS away_team, MIN(kickoff_utc) AS kickoff_utc
    FROM event
-   WHERE datetime(kickoff_utc) >= datetime('now')
+   WHERE datetime(kickoff_utc) >= datetime('now', '-${LIVE_WINDOW_H} hours')
    GROUP BY fixture_key
    ORDER BY datetime(MIN(kickoff_utc))
    LIMIT ?`
@@ -132,9 +136,13 @@ export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
       .filter(([source]) => source !== "polymarket" && source !== "kalshi" && source !== "sporttery")
       .map(([, probs]) => probs);
 
+    const kickoffMs = Date.parse(fixture.kickoff_utc);
+    const live = Number.isFinite(kickoffMs) && kickoffMs <= Date.now() && Date.now() < kickoffMs + LIVE_WINDOW_H * 3600_000;
+
     return {
       fixtureKey: fixture.fixture_key,
       kickoffUtc: fixture.kickoff_utc,
+      live,
       match: `${fixture.home_team} vs ${fixture.away_team}`,
       homeTeam: fixture.home_team,
       awayTeam: fixture.away_team,

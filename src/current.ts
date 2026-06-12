@@ -8,7 +8,7 @@ function parseLimit(): number {
 
 const rows = getCurrentOdds(parseLimit()).map((row) => ({
   kickoff_utc: row.kickoffUtc,
-  match: row.match,
+  match: `${row.live ? "LIVE " : ""}${row.match}`,
   polymarket: formatThreeWay(row.polymarket),
   kalshi: formatThreeWay(row.kalshi),
   pinnacle: formatThreeWay(row.pinnacle),

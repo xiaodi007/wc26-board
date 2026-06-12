@@ -6,10 +6,10 @@ import { getSportteryEdges, type SportteryAvoidanceRow } from "../queries/sportt
 import { getOutrightBoard } from "../queries/outright.js";
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
-import { getSportteryHhad } from "../queries/hhad.js";
+import { getAllSportteryHhad, getSportteryHhad, type HhadBoardRow } from "../queries/hhad.js";
 import { buildMatchContext } from "../ai/context.js";
 import { currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
-import { listAnalyses, type AiAnalysisRow } from "../db.js";
+import { countAlerts24h, listAnalyses, listRecentAlerts, type AiAnalysisRow } from "../db.js";
 import { zhTeamName } from "../teams.js";
 import { lineChart, sparkline, type ChartSeries } from "./svg.js";
 
@@ -126,6 +126,8 @@ footer{margin-top:40px;color:var(--dim);font-size:12px;border-top:1px solid var(
 .btn:hover{border-color:#3a4254}
 .btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
 .btn:disabled{opacity:.5;cursor:wait}
+.live-badge{display:inline-block;background:var(--red);color:#fff;border-radius:4px;font-size:10px;padding:0 6px;font-weight:700;vertical-align:middle;animation:livePulse 2s ease-in-out infinite}
+@keyframes livePulse{50%{opacity:.55}}
 </style>
 </head>
 <body>
@@ -182,6 +184,7 @@ function diffBadge(diffPp: number): string {
 }
 
 function sportteryRow(row: CurrentOddsRow): string {
+  if (row.live) return `<div class="sprow"><span class="t">体彩</span><span class="dim">已停售(比赛进行中)</span></div>`;
   if (!row.sporttery) return `<div class="sprow"><span class="t">体彩</span><span class="dim">未开售/未抓取</span></div>`;
   if (!row.bookAvg || row.books < MIN_BOOKS) {
     return `<div class="sprow"><span class="t">体彩</span>${LABELS.map((l) => `<span>${pct(row.sporttery![l])}</span>`).join("")}<span class="dim">书商样本不足,不比价</span></div>`;
@@ -209,9 +212,13 @@ function matchCard(row: CurrentOddsRow): string {
     `<span>主胜: PM ${pct(row.polymarket?.home ?? null)} · Kalshi ${pct(row.kalshi?.home ?? null)} · Pin ${pct(row.pinnacle?.home ?? null)}</span>` +
     `<span style="margin-left:auto">${cardSpark(row)}</span>` +
     `</div>`;
+  const elapsedMin = Math.max(0, Math.round((Date.now() - Date.parse(row.kickoffUtc)) / 60000));
+  const ko = row.live
+    ? `<span class="live-badge">LIVE ${elapsedMin}'</span>`
+    : `<span class="ko">${bjTime.format(new Date(row.kickoffUtc))}</span>`;
   return (
     `<a class="card" href="/match?fk=${encodeURIComponent(row.fixtureKey)}">` +
-    `<div class="head"><span class="ko">${bjTime.format(new Date(row.kickoffUtc))}</span><span class="teams">${esc(matchZh(row))}</span><span class="dim" style="font-size:11px">详情 →</span></div>` +
+    `<div class="head">${ko}<span class="teams">${esc(matchZh(row))}</span><span class="dim" style="font-size:11px">详情 →</span></div>` +
     (consensus ? consensusBar(consensus) + probRow(row, consensus) : `<div class="dim">暂无报价</div>`) +
     sportteryRow(row) +
     mini +
@@ -231,6 +238,31 @@ function edgeTable(rows: SportteryAvoidanceRow[], empty: string): string {
     )
     .join("");
   return `<table><tr><th>开球(北京)</th><th>比赛</th><th>方向</th><th class="num">体彩</th><th class="num">书商中位</th><th class="num">差(pp)</th></tr>${body}</table>`;
+}
+
+function hhadBoardSection(): string {
+  const rows = getAllSportteryHhad();
+  if (!rows.length) return "";
+
+  const tr = (r: HhadBoardRow): string =>
+    `<tr><td>${esc(bjFull.format(new Date(r.kickoffUtc)))}</td>` +
+    `<td><a href="/match?fk=${encodeURIComponent(r.fixtureKey)}">${esc(teamZh(r.homeTeam))} vs ${esc(teamZh(r.awayTeam))}</a></td>` +
+    `<td>${hhadLineDesc(r.goalLine, r.homeTeam)}</td>` +
+    `<td class="num">${LABELS.map((l) => (r.sp[l] !== null ? r.sp[l]!.toFixed(2) : "-")).join(" / ")}</td>` +
+    `<td class="num">${r.probs ? LABELS.map((l) => pct(r.probs![l])).join(" / ") : "-"}</td>` +
+    `<td class="dim">${r.sourceUpdatedTs ? esc(bjFull.format(new Date(r.sourceUpdatedTs))) : "-"}</td></tr>`;
+
+  const header = `<tr><th>开球(北京)</th><th>比赛</th><th>盘口</th><th class="num">SP 让球胜/平/负</th><th class="num">归一隐含</th><th>官方更新</th></tr>`;
+  const head = rows.slice(0, 10).map(tr).join("");
+  const rest = rows.slice(10);
+  const restHtml = rest.length
+    ? `<details><summary>更多 ${rest.length} 场</summary><table>${header}${rest.map(tr).join("")}</table></details>`
+    : "";
+
+  return (
+    `<h2>体彩让球胜平负(HHAD)<small>共 ${rows.length} 场;无国际让球盘参照,仅展示不比价</small></h2>` +
+    `<div class="panel"><table>${header}${head}</table>${restHtml}</div>`
+  );
 }
 
 function outrightSection(): string {
@@ -258,6 +290,21 @@ function outrightSection(): string {
   );
 }
 
+function alertsSection(): string {
+  const recent = listRecentAlerts(10);
+  if (!recent.length) return "";
+  const items = recent
+    .map(
+      (a) =>
+        `<div style="font-size:12px;padding:2px 0"><span class="dim">${esc(bjFull.format(new Date(a.ts + "Z")))}</span> · <span class="chip" style="font-size:11px">${esc(a.kind)}</span> ${esc(a.title)}</div>`
+    )
+    .join("");
+  return (
+    `<details id="alerts"><summary>最近告警(24h 内 ${countAlerts24h()} 条;微信推送走 Server酱,合并+日上限)</summary>` +
+    `<div class="panel" style="margin-top:8px">${items}</div></details>`
+  );
+}
+
 function healthSection(): string {
   const { checks, counts } = runHealthChecks();
   const items = checks
@@ -276,8 +323,15 @@ export function boardPage(): string {
   const all = getCurrentOdds(50);
   const now = Date.now();
   const horizon = now + CARD_WINDOW_H * 3600_000;
-  const near = all.filter((r) => Date.parse(r.kickoffUtc) <= horizon);
-  const far = all.filter((r) => Date.parse(r.kickoffUtc) > horizon);
+  const liveRows = all.filter((r) => r.live);
+  const near = all.filter((r) => !r.live && Date.parse(r.kickoffUtc) <= horizon);
+  const far = all.filter((r) => !r.live && Date.parse(r.kickoffUtc) > horizon);
+
+  const liveSection = liveRows.length
+    ? `<div class="dayhead" style="color:var(--red);font-weight:600">进行中 · 盘中实时概率(体彩已停售)</div><div class="cards">${liveRows
+        .map(matchCard)
+        .join("")}</div>`
+    : "";
 
   let cards = "";
   let lastDay = "";
@@ -310,12 +364,20 @@ export function boardPage(): string {
     `<div class="grid2"><div class="panel"><h2 style="margin:0 0 8px;color:var(--red)">避坑(体彩隐含概率偏高)</h2>${edgeTable(edges.avoid, "当前没有显著偏高的方向")}</div>` +
     `<div class="panel"><h2 style="margin:0 0 8px;color:var(--green)">相对划算(体彩赔率偏高)</h2>${edgeTable(edges.value, "当前没有显著偏低的方向")}</div></div>`;
 
+  const alerts24h = countAlerts24h();
+  const alertChip = alerts24h
+    ? `<a class="chip" href="#alerts" style="border-color:var(--red)">告警 <b style="color:var(--red)">${alerts24h}</b></a>`
+    : "";
+
   const body =
-    `<header class="top"><h1>WC26 Board</h1>${freshnessChips()}<span class="chip">北京时间 <b>${esc(bjFull.format(new Date()))}</b></span></header>` +
+    `<header class="top"><h1>WC26 Board</h1>${freshnessChips()}${alertChip}<span class="chip">北京时间 <b>${esc(bjFull.format(new Date()))}</b></span></header>` +
+    liveSection +
     cards +
     farList +
     edgeSection +
+    hhadBoardSection() +
     outrightSection() +
+    alertsSection() +
     healthSection() +
     `<footer>纯本地只读聚合,个人参考,不构成投注建议。体彩数据为手动低频抓取,以官方实时 SP 为准。</footer>`;
 
@@ -396,17 +458,18 @@ function historyCharts(fixtureKey: string): string {
   return legend + `<div class="grid3">${chart("home")}${chart("draw")}${chart("away")}</div>` + jumpList;
 }
 
+function hhadLineDesc(goalLine: string, homeTeam: string): string {
+  const line = Number(goalLine);
+  if (!Number.isFinite(line)) return esc(goalLine);
+  if (line < 0) return `${teamZh(homeTeam)} 让 ${Math.abs(line)} 球`;
+  if (line > 0) return `${teamZh(homeTeam)} 受让 ${line} 球`;
+  return "平手盘";
+}
+
 function hhadSection(fixtureKey: string, row: CurrentOddsRow): string {
   const hhad = getSportteryHhad(fixtureKey);
   if (!hhad) return "";
-  const line = Number(hhad.goalLine);
-  const lineDesc = Number.isFinite(line)
-    ? line < 0
-      ? `${teamZh(row.homeTeam)} 让 ${Math.abs(line)} 球`
-      : line > 0
-        ? `${teamZh(row.homeTeam)} 受让 ${line} 球`
-        : "平手盘"
-    : esc(hhad.goalLine);
+  const lineDesc = hhadLineDesc(hhad.goalLine, row.homeTeam);
   const cells = LABELS.map(
     (l) =>
       `<td class="num">${hhad.sp[l] !== null ? hhad.sp[l]!.toFixed(2) : "-"}<span class="dim" style="font-size:11px;margin-left:4px">${hhad.probs ? pct(hhad.probs[l]) : "-"}</span></td>`
@@ -522,17 +585,22 @@ export function matchPage(fixtureKey: string): string {
   if (!row) {
     return page(
       "比赛未找到",
-      `<header class="top"><h1><a href="/">← WC26 Board</a></h1></header><p class="dim">没有找到这场比赛(可能已开赛,当前读层只覆盖未开赛场次)。</p>`
+      `<header class="top"><h1><a href="/">← WC26 Board</a></h1></header><p class="dim">没有找到这场比赛(可能已完赛,读层只覆盖未开赛与进行中场次)。</p>`
     );
   }
 
   const kickoff = new Date(row.kickoffUtc);
   const hoursTo = (kickoff.getTime() - Date.now()) / 3600_000;
-  const countdown = hoursTo >= 48 ? `${Math.round(hoursTo / 24)} 天后` : `${Math.max(0, hoursTo).toFixed(1)} 小时后`;
+  const countdown = row.live
+    ? `进行中(开球于 ${Math.max(0, Math.round(-hoursTo * 60))} 分钟前)`
+    : hoursTo >= 48
+      ? `${Math.round(hoursTo / 24)} 天后`
+      : `${Math.max(0, hoursTo).toFixed(1)} 小时后`;
+  const liveBadge = row.live ? ` <span class="live-badge" style="font-size:13px">LIVE</span>` : "";
 
   const body =
     `<header class="top"><h1><a href="/">← WC26 Board</a></h1>${freshnessChips()}</header>` +
-    `<h2 style="font-size:20px;margin-top:6px">${esc(matchZh(row))} <small>${esc(row.match)}</small></h2>` +
+    `<h2 style="font-size:20px;margin-top:6px">${esc(matchZh(row))}${liveBadge} <small>${esc(row.match)}</small></h2>` +
     `<p class="dim">开球:${esc(bjFull.format(kickoff))}(北京) · ${esc(row.kickoffUtc)} · ${countdown}</p>` +
     aiSection(fixtureKey, row) +
     `<h2>各源三向归一概率 <small>diff 相对书商中位,红=偏高(避坑)、绿=偏低(划算)</small></h2>` +

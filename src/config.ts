@@ -47,6 +47,12 @@ export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 export const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 export const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
 
+// 告警:Server酱微信推送。免费版每日配额很小(约 5 条),所有新事件合并成一条推,另设日上限兜底。
+// key 为空时只落 alert_log 不推送(页面仍可见)。
+export const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY || "";
+export const ALERT_JUMP_PP = Number(process.env.ALERT_JUMP_PP || 3);
+export const ALERT_MAX_PER_DAY = Number(process.env.ALERT_MAX_PER_DAY || 5);
+
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }

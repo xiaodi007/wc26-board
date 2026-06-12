@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS ai_analysis (
   response TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_fixture ON ai_analysis(fixture_key, ts);
+CREATE TABLE IF NOT EXISTS alert_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  kind TEXT NOT NULL,
+  dedup_key TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  detail TEXT
+);
 `;
 
 export const db = new Database(DB_PATH);
@@ -191,4 +199,32 @@ export function insertAnalysis(fixtureKey: string, model: string, systemPrompt: 
 
 export function listAnalyses(fixtureKey: string, limit = 5): AiAnalysisRow[] {
   return stmtListAnalyses.all(fixtureKey, Math.min(Math.max(limit, 1), 20)) as AiAnalysisRow[];
+}
+
+export interface AlertRow {
+  id: number;
+  ts: string;
+  kind: string;
+  dedup_key: string;
+  title: string;
+  detail: string | null;
+}
+
+const stmtInsertAlert = db.prepare(
+  `INSERT OR IGNORE INTO alert_log (kind, dedup_key, title, detail) VALUES (?, ?, ?, ?)`
+);
+const stmtListAlerts = db.prepare(`SELECT * FROM alert_log ORDER BY ts DESC, id DESC LIMIT ?`);
+const stmtCountAlerts24h = db.prepare(`SELECT COUNT(*) AS n FROM alert_log WHERE ts >= datetime('now', '-1 day')`);
+
+// 去重即落库:dedup_key 撞 UNIQUE 则忽略,返回是否为新事件
+export function insertAlertIfNew(kind: string, dedupKey: string, title: string, detail: string | null = null): boolean {
+  return stmtInsertAlert.run(kind, dedupKey, title, detail).changes > 0;
+}
+
+export function listRecentAlerts(limit = 10): AlertRow[] {
+  return stmtListAlerts.all(Math.min(Math.max(limit, 1), 50)) as AlertRow[];
+}
+
+export function countAlerts24h(): number {
+  return (stmtCountAlerts24h.get() as { n: number }).n;
 }

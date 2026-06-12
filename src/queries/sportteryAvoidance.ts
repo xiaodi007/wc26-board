@@ -28,6 +28,7 @@ export function getSportteryEdges(
   const avoid: SportteryAvoidanceRow[] = [];
   const value: SportteryAvoidanceRow[] = [];
   for (const fixture of fixtures) {
+    if (fixture.live) continue; // 体彩赛前停售,盘中 diff 无决策意义
     if (!fixture.sporttery || !fixture.bookAvg || fixture.books < minBooks) continue;
     for (const label of LABELS) {
       const sporttery = fixture.sporttery[label];

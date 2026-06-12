@@ -6,6 +6,7 @@ import { getMeta } from "./db.js";
 import { pollOdds } from "./sources/oddsapi.js";
 import { pollOutright, pollMatchGames } from "./sources/polymarket.js";
 import { pollKalshiOutright, pollKalshiMatches } from "./sources/kalshi.js";
+import { checkAlerts } from "./alerts.js";
 
 const TICK_MS = 60_000;
 let lastPm = 0;
@@ -45,6 +46,12 @@ async function tick(): Promise<void> {
         log(`daemon: oddsapi cycle failed: ${String(e)}`);
       }
     }
+  }
+
+  try {
+    await checkAlerts();
+  } catch (e) {
+    log(`daemon: alerts failed: ${String(e)}`);
   }
 }
 

@@ -2,8 +2,8 @@
 
 2026 世界杯赔率聚合 dashboard(**纯个人自用**:只读聚合 + 分析,不下单、不对外发布)。
 
-当前状态:Phase B 完成 — Kalshi 已进 daemon 轮询,决策 board(`npm run board`)与 AI 分析面板可用;采集、健康检查、当前赔率、体彩抓取/导入、避坑指数均正常,后台继续攒不可回填的赔率历史。
-体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析需在 `.env` 配 `ANTHROPIC_API_KEY`(不配则降级为 prompt 预览+复制)。
+当前状态:Phase C 完成 — board 增加 HHAD 让球盘视图与 LIVE 进行中场次,daemon 集成 Server酱微信告警(盘口突变/体彩价差/health FAIL,合并推送+日上限)。
+体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析需在 `.env` 配 `ANTHROPIC_API_KEY`(不配则降级为 prompt 预览+复制);告警推送需配 `SERVERCHAN_KEY`(不配则只落库、页面可见)。
 
 ## 快速开始
 
@@ -31,7 +31,9 @@ tail -F logs/daemon.log
 - 体彩竞彩:用官方计算器公开 JSON 接口手动低频抓 `HAD`/`HHAD`;如果被 WAF 拦截,退回本地 CSV/JSON 导入。
 - 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Kalshi / Pinnacle / 体彩 HAD / 书商中位三向归一概率。
 - 避坑指数: `npm run avoid:sporttery` 输出体彩 HAD 隐含概率高于国际书商共识的选项,用于识别相对不划算方向,不是投注建议。
-- 决策 board: `npm run board` 起本地只读页面(127.0.0.1:4626)——比赛卡片流(共识条+体彩 diff 着色+sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi)、详情页全源表+48h 走势+HHAD。
+- 决策 board: `npm run board` 起本地只读页面(127.0.0.1:4626)——比赛卡片流(共识条+体彩 diff 着色+sparkline)、避坑/划算双榜、HHAD 让球盘面板、夺冠 Top10(PM vs Kalshi)、详情页全源表+48h 走势+HHAD。
+- LIVE: 开球后 2.5h 内场次不消失——主页置顶「进行中」(LIVE 徽标+已比分钟数),体彩标注已停售并退出避坑比价;PM/Kalshi 盘中实时概率照常流入。
+- 告警: daemon 每分钟检测**主力源盘口突变(≥3pp)**、**体彩 vs 共识新条目**、**health FAIL**,`alert_log` 表 UNIQUE 去重;配 `SERVERCHAN_KEY` 后合并成一条微信推送(免费配额小,绝不一事一推,另有 `ALERT_MAX_PER_DAY` 日上限,默认 5);Server酱请求用独立直连 Agent 绕开 HTTPS_PROXY。
 - AI 分析: 详情页一键生成结构化解读(倾向/信号/风险/体彩视角),prompt 透明可编辑,分析历史落库;数据组装为 ~1.5k tokens 高密度上下文(归一概率、预计算价差、关键点走势、夺冠锚、新鲜度)。
 
 ## 命令
@@ -110,7 +112,8 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 - ~~Kalshi 接入~~:已完成(冠军盘 + 单场,daemon 5min)。
 - ~~Phase B 决策 dashboard~~:已完成(`npm run board`):比赛卡片流(共识条 + 体彩 diff 着色 + sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi 互证)、详情页全源表 + 48h 三向走势 + HHAD、health 摘要;书商共识用中位数抗离群。
 - ~~Phase B AI 分析面板~~:已完成:`src/ai/context.ts` 组装高密度上下文,`src/ai/analyze.ts` 调 Claude(结构化输出 json_schema,默认 `claude-sonnet-4-6`,`.env` 可覆盖),结果落 `ai_analysis` 表;模板存 meta 可在页面编辑;无 key 降级为复制 prompt。**待办:配 `ANTHROPIC_API_KEY` 后跑一次真实调用验证。**
-- Phase C:HHAD 让球视图进 board、可选告警(突变/避坑阈值触发)、AI 批量分析当日场次。
+- ~~Phase C~~:已完成:HHAD 让球盘主页面板、Server酱告警(实测推送+去重通过)、LIVE 进行中场次(待 6/13 凌晨开赛实测观感)。
+- 后续候选:AI 批量分析当日场次(早报)、让球盘公平概率建模(由 1X2 推导,需进球模型)、完赛比分采集。
 
 ## 交接检查清单
 

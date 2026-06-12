@@ -29,8 +29,7 @@ interface RawRow {
   updated: string | null;
 }
 
-export function getSportteryHhad(fixtureKey: string): HhadView | null {
-  const rows = hhadStmt.all(fixtureKey) as RawRow[];
+function assembleView(rows: RawRow[]): HhadView | null {
   if (rows.length === 0) return null;
 
   const partial: Partial<ThreeWay> = {};
@@ -51,4 +50,61 @@ export function getSportteryHhad(fixtureKey: string): HhadView | null {
   }
 
   return { goalLine, sp, probs: normalizeThreeWay(partial), sourceUpdatedTs: updated };
+}
+
+export function getSportteryHhad(fixtureKey: string): HhadView | null {
+  return assembleView(hhadStmt.all(fixtureKey) as RawRow[]);
+}
+
+// 主页批量视图:未开赛场次的最新 HHAD,按开球时间排序
+export interface HhadBoardRow extends HhadView {
+  fixtureKey: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffUtc: string;
+}
+
+const allHhadStmt = db.prepare(
+  `WITH latest AS (SELECT outcome_id, MAX(ts) AS ts FROM snapshot GROUP BY outcome_id)
+   SELECT e.fixture_key AS fixture_key, e.home_team AS home_team, e.away_team AS away_team, e.kickoff_utc AS kickoff_utc,
+          o.outcome_label AS label, s.prob_implied AS prob, s.raw_price AS raw, m.spec AS spec, s.source_updated_ts AS updated
+   FROM market m
+   JOIN event e ON e.id = m.event_id
+   JOIN outcome o ON o.market_id = m.id
+   JOIN latest l ON l.outcome_id = o.id
+   JOIN snapshot s ON s.outcome_id = o.id AND s.ts = l.ts
+   WHERE m.source = 'sporttery' AND m.market_type = 'sporttery_hhad'
+     AND datetime(e.kickoff_utc) >= datetime('now')
+   ORDER BY datetime(e.kickoff_utc)`
+);
+
+interface RawBoardRow extends RawRow {
+  fixture_key: string;
+  home_team: string;
+  away_team: string;
+  kickoff_utc: string;
+}
+
+export function getAllSportteryHhad(): HhadBoardRow[] {
+  const rows = allHhadStmt.all() as RawBoardRow[];
+  const byFixture = new Map<string, RawBoardRow[]>();
+  for (const row of rows) {
+    const group = byFixture.get(row.fixture_key) ?? [];
+    group.push(row);
+    byFixture.set(row.fixture_key, group);
+  }
+
+  const result: HhadBoardRow[] = [];
+  for (const group of byFixture.values()) {
+    const view = assembleView(group);
+    if (!view) continue;
+    result.push({
+      ...view,
+      fixtureKey: group[0].fixture_key,
+      homeTeam: group[0].home_team,
+      awayTeam: group[0].away_team,
+      kickoffUtc: group[0].kickoff_utc,
+    });
+  }
+  return result.sort((a, b) => Date.parse(a.kickoffUtc) - Date.parse(b.kickoffUtc));
 }
