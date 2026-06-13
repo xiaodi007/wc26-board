@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { API_FOOTBALL_KEY, WALRUS_AGGREGATOR_URL, WALRUS_FEED_DIR } from "../config.js";
 import { getCompletedOdds, getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "../queries/currentOdds.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
-import { getSportteryEdges, type SportteryAvoidanceRow } from "../queries/sportteryAvoidance.js";
+import { getSportteryEdges, SPORTTERY_EDGE_PP, SPORTTERY_MIN_BOOKS, type SportteryAvoidanceRow } from "../queries/sportteryAvoidance.js";
 import { getOutrightBoard } from "../queries/outright.js";
 import {
   compactMoney,
@@ -20,6 +20,7 @@ import {
 } from "../queries/marketIntelligence.js";
 import { getProbabilityCandidates, type ProbabilityCandidate, type SourceContribution } from "../queries/probabilityModel.js";
 import { getMatchEventBundle, type MatchEventBundle, type MatchEventRow } from "../queries/matchEvents.js";
+import { getReviewBoard, type ReviewJump, type ReviewMatch, type ReviewQuality } from "../queries/reviewBoard.js";
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getAllSportteryHhad, getSportteryHhad, type HhadBoardRow } from "../queries/hhad.js";
 import { buildMatchContext } from "../ai/context.js";
@@ -46,8 +47,8 @@ import {
 } from "./i18n.js";
 
 const LABEL_COLOR: Record<Label, string> = { home: "var(--lime)", draw: "var(--cyan)", away: "var(--violet)" };
-const DIFF_PP = 2;
-const MIN_BOOKS = 5;
+const DIFF_PP = SPORTTERY_EDGE_PP;
+const MIN_BOOKS = SPORTTERY_MIN_BOOKS;
 const CARD_WINDOW_H = 48;
 const SOURCE_COLOR: Record<string, string> = {
   polymarket: "var(--cyan)",
@@ -70,10 +71,6 @@ function signedPp(v: number | null | undefined): string {
   return `${v >= 0 ? "+" : "-"}${Math.abs(v).toFixed(1)}`;
 }
 
-function team(locale: Locale, name: string): string {
-  return displayTeam(locale, name);
-}
-
 function titleCaseTeam(name: string): string {
   return name
     .split(/\s+/)
@@ -82,17 +79,13 @@ function titleCaseTeam(name: string): string {
     .join(" ");
 }
 
-function displayTeam(locale: Locale, name: string): string {
+function team(locale: Locale, name: string): string {
   if (locale === "zh") return zhTeamName(name) ?? name;
   return /[\u4e00-\u9fff]/.test(name) ? titleCaseTeam(normalizeTeam(name)) : name;
 }
 
-function localizedTeam(locale: Locale, name: string): string {
-  return displayTeam(locale, name);
-}
-
 function matchName(locale: Locale, home: string, away: string): string {
-  return `${localizedTeam(locale, home)} vs ${localizedTeam(locale, away)}`;
+  return `${team(locale, home)} vs ${team(locale, away)}`;
 }
 
 function matchNameFromRow(locale: Locale, row: CurrentOddsRow): string {
@@ -106,8 +99,8 @@ function localizeMatch(locale: Locale, raw: string | undefined): string | undefi
 }
 
 function outcomeName(locale: Locale, row: CurrentOddsRow, label: Label): string {
-  if (label === "home") return localizedTeam(locale, row.homeTeam);
-  if (label === "away") return localizedTeam(locale, row.awayTeam);
+  if (label === "home") return team(locale, row.homeTeam);
+  if (label === "away") return team(locale, row.awayTeam);
   return outcomeLabel(locale, "draw");
 }
 
@@ -294,12 +287,19 @@ function reviewGoalMarkers(locale: Locale, row: CurrentOddsRow, bundle: MatchEve
     .filter((row): row is { t: number; label: string; color?: string } => row !== null);
 }
 
-function reviewTrendChart(locale: Locale, row: CurrentOddsRow, history: SourceLineHistory[], markers: { t: number; label: string; color?: string }[] = []): string {
+function reviewTrendChart(
+  locale: Locale,
+  row: CurrentOddsRow,
+  history: SourceLineHistory[],
+  markers: { t: number; label: string; color?: string }[] = [],
+  defaultOutcome: Label = "home"
+): string {
   const drawnSources = history.filter((s) => SOURCE_COLOR[s.source] && s.points.length > 0);
   if (!drawnSources.length) return `<p class="dim">${locale === "zh" ? "这场比赛暂无可复盘的赔率走势。" : "No reviewable odds history for this match yet."}</p>`;
   const { fromTs, toTs } = reviewWindow(row);
   const tMin = Date.parse(fromTs);
   const tMax = Date.parse(toTs);
+  // 默认只显示一个结果走势(通常是赛果方向),其余结果与各平台靠开关切换,数据一次性渲染、前端切显隐。
   const chart = (label: Label): string => {
     const series: ChartSeries[] = drawnSources.map((s) => ({
       name: s.source,
@@ -308,10 +308,22 @@ function reviewTrendChart(locale: Locale, row: CurrentOddsRow, history: SourceLi
       markersOnly: s.source === "sporttery",
       points: s.points.map((p) => ({ t: Date.parse(p.ts), v: p.probs[label] })),
     }));
-    return `<div class="chart-cell"><div class="chart-title">${esc(outcomeLabel(locale, label))}</div>${lineChart(series, { tMin, tMax, markers })}</div>`;
+    return `<div class="chart-cell" data-outcome="${label}"${label === defaultOutcome ? "" : " hidden"}><div class="chart-title">${esc(outcomeLabel(locale, label))}</div>${lineChart(series, { tMin, tMax, markers })}</div>`;
   };
+  const outcomeBtns = LABELS.map(
+    (label) => `<button type="button" data-v="${label}" class="${label === defaultOutcome ? "active" : ""}">${esc(outcomeLabel(locale, label))}</button>`
+  ).join("");
+  const srcBtns =
+    `<button type="button" data-v="all" class="active">${locale === "zh" ? "全部" : "All"}</button>` +
+    drawnSources.map((s) => `<button type="button" data-v="${esc(s.source)}">${esc(s.source)}</button>`).join("");
   const legend = `<div class="legend">${drawnSources.map((s) => `<span><i style="background:${SOURCE_COLOR[s.source]}"></i>${esc(s.source)}</span>`).join("")}</div>`;
-  return `${legend}<div class="chart-grid">${LABELS.map(chart).join("")}</div>`;
+  return (
+    `<div class="rv-trend">` +
+    `<div class="rv-trend-bar"><div class="rv-toggle" data-rv-trend="outcome">${outcomeBtns}</div><div class="rv-toggle" data-rv-trend="src">${srcBtns}</div></div>` +
+    legend +
+    `<div class="chart-grid">${LABELS.map(chart).join("")}</div>` +
+    `</div>`
+  );
 }
 
 function sourcePriority(source: string): number {
@@ -498,7 +510,7 @@ function walrusProof(locale: Locale): string {
     `<div class="proof-grid">` +
     `<div><span>${esc(t.labels.network)}</span><b>${esc(network)}</b></div>` +
     `<div><span>${esc(t.labels.schema)}</span><b>${esc(schema)}</b></div>` +
-    `<div><span>${esc(t.labels.generated)}</span><b>${publishedAt ? esc(fullTime(locale, new Date(publishedAt))) : "-"}</b></div>` +
+    `<div><span>${esc(t.labels.published)}</span><b>${publishedAt ? esc(fullTime(locale, new Date(publishedAt))) : "-"}</b></div>` +
     `<div class="proof-blob"><span>${esc(t.labels.blob)}</span><b>${blob ? esc(blob) : esc(t.empty.walrus)}</b></div>` +
     `</div>${object ? `<div class="muted-line">object: <span class="mono">${esc(object)}</span></div>` : ""}` +
     `</section>`
@@ -555,8 +567,8 @@ function bettingPlanPanel(locale: Locale, model: ReturnType<typeof getMarketRada
     model.matches.map((m) => [
       m.row.fixtureKey,
       {
-        home: localizedTeam(locale, m.row.homeTeam),
-        away: localizedTeam(locale, m.row.awayTeam),
+        home: team(locale, m.row.homeTeam),
+        away: team(locale, m.row.awayTeam),
         match: matchNameFromRow(locale, m.row),
       },
     ])
@@ -753,7 +765,7 @@ function renderPlan(data, opts){
   var bets=data.plan.rows.filter(function(r){return r.bucket==="bet" && r.stake>0;});
   var watch=(data.verdict.watchlist||[]).slice(0,6);
   var avoid=(data.verdict.avoid||[]).slice(0,6);
-  var formula="<details class='details-panel'><summary>${locale === "zh" ? "公式细节" : "Formula details"}</summary><p class='opp-note'>Kelly fraction = 25% × raw Kelly；单注上限 = 本金 1%；总下注受最大日亏损限制。EV = stake × (model_probability × decimal_odds - 1)。这里只是个人研究，不保证收益。</p></details>";
+  var formula="<details class='details-panel'><summary>${locale === "zh" ? "公式细节" : "Formula details"}</summary><p class='opp-note'>${locale === "zh" ? "Kelly fraction = 25% × raw Kelly；单注上限 = 本金 1%；总下注受最大日亏损限制。EV = stake × (model_probability × decimal_odds - 1)。这里只是个人研究，不保证收益。" : "Kelly fraction = 25% × raw Kelly; max stake per pick = 1% of bankroll; total stake is capped by max daily loss. EV = stake × (model_probability × decimal_odds − 1). Personal research only, no profit guarantee."}</p></details>";
   var summary="<div class='plan-summary'><div><span>${locale === "zh" ? "总下注" : "Total stake"}</span><b>"+planMoney(s.totalStake)+"</b></div><div><span>${locale === "zh" ? "最坏亏损" : "Worst loss"}</span><b>"+planMoney(s.worstCaseLoss)+"</b></div><div><span>${locale === "zh" ? "全中净收益" : "All-win profit"}</span><b>"+planMoney(s.allWinNetProfit)+"</b></div><div><span>${locale === "zh" ? "期望收益" : "Expected value"}</span><b>"+planMoney(s.expectedValue)+"</b></div><div><span>${locale === "zh" ? "预计亏损概率" : "Approx. loss prob."}</span><b>"+(s.approximateLossProbability===null?"-":planPct(s.approximateLossProbability))+"</b></div></div>";
   var betHtml=bets.length ? bets.map(betCard).join("") : "<div class='plan-empty'>${locale === "zh" ? "当前没有达到正 EV + 2pp 门槛的下注建议。" : "No pick cleared the positive-EV + 2pp threshold."}</div>";
   planOutput("<div class='plan-verdict'>"+h(readableVerdict(data))+"</div>"+planSourceLine(data,opts)+"<p class='hero-sub'>"+h(data.verdict.summary_zh||"")+"</p>"+summary+"<div class='plan-bucket good'><h3>${locale === "zh" ? "可以买" : "Can buy"}</h3>"+betHtml+"</div><div class='plan-bucket watch'><h3>${locale === "zh" ? "先观察" : "Watch first"}</h3>"+planItemRows(watch,'watch')+"</div><div class='plan-bucket avoid'><h3>${locale === "zh" ? "别买 / 避坑" : "Avoid"}</h3>"+planItemRows(avoid,'avoid')+"</div>"+formula);
@@ -807,7 +819,7 @@ function bettingListText(data){
   var lines=[readableVerdict(data)];
   bets.forEach(function(r){
     var match=window.__matchNames[r.fixture_key]||r.fixture_key;
-    lines.push("买 "+planOutcome(r)+" · "+match+" · "+r.offeredOdd.platform+" @ "+Number(r.offeredOdd.decimalOdds).toFixed(3)+" · "+planMoney(r.stake)+" · max loss "+planMoney(r.maxLoss)+" · EV "+planMoney(r.expectedValue));
+    lines.push("${locale === "zh" ? "买 " : "Buy "}"+planOutcome(r)+" · "+match+" · "+r.offeredOdd.platform+" @ "+Number(r.offeredOdd.decimalOdds).toFixed(3)+" · "+planMoney(r.stake)+" · max loss "+planMoney(r.maxLoss)+" · EV "+planMoney(r.expectedValue));
   });
   if(!bets.length) lines.push(${JSON.stringify(locale === "zh" ? "没有满足条件的下注。" : "No qualifying bets.")});
   return lines.join("\\n");
@@ -858,21 +870,6 @@ function metricStrip(locale: Locale, model = getMarketRadar()): string {
     .join("")}</div>`;
 }
 
-function aiBrief(locale: Locale, model = getMarketRadar()): string {
-  const t = COPY[locale];
-  return (
-    `<aside class="ai-brief"><details><summary><span class="spark-dot"></span><b>${esc(t.aiBrief)}</b><span class="badge info">${esc(t.signals)}</span></summary>` +
-    `<div class="brief-list">${model.aiBrief
-      .slice(0, 5)
-      .map((item) => {
-        const match = localizeMatch(locale, item.match);
-        const outcome = item.outcomeName && item.outcomeName !== "Draw" ? team(locale, item.outcomeName) : item.outcomeName === "Draw" ? outcomeLabel(locale, "draw") : undefined;
-        return `<div class="brief-item"><div><b>${esc(briefTitle(locale, item))}</b>${riskBadge(locale, item.level)}</div><p>${esc(briefText(locale, item, match, outcome))}</p><span class="brief-tag">${esc(briefTag(locale, item))}</span></div>`;
-      })
-      .join("")}</div></details></aside>`
-  );
-}
-
 function sidebar(locale: Locale, active: PageActive): string {
   const t = COPY[locale];
   const item = (key: keyof typeof t.sidebar, url: string, icon: string, isActive = false): string =>
@@ -912,7 +909,6 @@ function topbar(
     `<input name="q" list="match-list" placeholder="${esc(t.search)}" autocomplete="off">` +
     `<input type="hidden" name="fk"><input type="hidden" name="lang" value="${locale}"><datalist id="match-list">${options}</datalist>` +
     `</form>` +
-    `<nav class="top-nav"><a class="${active === "home" ? "active" : ""}" href="${href("/", locale)}">${esc(t.home)}</a><a class="${active === "opportunities" ? "active" : ""}" href="${href("/opportunities", locale)}">${esc(t.opportunities)}</a><a class="${active === "review" ? "active" : ""}" href="${href("/review", locale)}">${esc(t.sidebar.review)}</a><a class="${active === "walrus" ? "active" : ""}" href="${href("/walrus", locale)}">Walrus</a></nav>` +
     `<div class="top-actions">${freshnessChips(locale)}<a class="lang-pill" href="${href(switchPath, other, switchParams)}">${esc(LOCALE_NAME[other])}</a><a class="lang-pill" href="${active === "match" ? "#ai" : "#brief"}">${esc(t.aiBrief)}</a></div>` +
     `<script>
 function goMatchSearch(form){
@@ -956,7 +952,7 @@ a{color:inherit;text-decoration:none}
 .side-card{margin-top:auto;border:1px solid var(--line);border-radius:8px;padding:12px;background:rgba(13,25,42,.58);display:grid;gap:4px}.side-card span,.side-card small{color:var(--dim);font-size:12px}
 .workspace{min-width:0;padding:0 22px 56px}.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;min-width:0;max-width:100%;padding:12px 0;background:linear-gradient(180deg,rgba(6,17,31,.98),rgba(6,17,31,.78));backdrop-filter:blur(18px);border-bottom:1px solid var(--line)}
 .search{flex:1;min-width:280px;max-width:520px}.search input[name=q]{width:100%;height:38px;border:1px solid var(--line);border-radius:9px;background:rgba(5,12,22,.82);color:var(--text);padding:0 14px;outline:none}.search input:focus{border-color:var(--line2);box-shadow:0 0 0 3px rgba(67,199,255,.08)}
-.top-nav{display:flex;gap:6px}.top-nav a,.top-actions button,.lang-pill{height:34px;display:inline-flex;align-items:center;border:1px solid var(--line);background:rgba(14,24,39,.62);color:var(--text);border-radius:999px;padding:0 11px;font-size:12px;cursor:pointer}.top-nav a.active,.top-nav a:hover,.top-actions button:hover,.lang-pill:hover{border-color:var(--line2);box-shadow:inset 0 0 18px rgba(67,199,255,.08)}
+.top-actions button,.lang-pill{height:34px;display:inline-flex;align-items:center;border:1px solid var(--line);background:rgba(14,24,39,.62);color:var(--text);border-radius:999px;padding:0 11px;font-size:12px;cursor:pointer}.top-actions button:hover,.lang-pill:hover{border-color:var(--line2);box-shadow:inset 0 0 18px rgba(67,199,255,.08)}
 .top-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-left:auto;min-width:0;max-width:100%;overflow:visible}.top-actions::-webkit-scrollbar,.side-nav::-webkit-scrollbar{height:0}.chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--dim);background:rgba(12,22,36,.52);white-space:nowrap}.chip.ok b{color:var(--lime)}.chip.warn b{color:var(--amber)}.chip.stale b{color:var(--red)}
 .hero-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(340px,.55fr);gap:14px;margin-top:16px;min-width:0}.bento{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;min-width:0}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span12{grid-column:span 12}
 .panel,.card,.metric-card{min-width:0;background:linear-gradient(180deg,rgba(15,28,47,.88),rgba(8,18,31,.84));border:1px solid var(--line);border-radius:8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 22px 60px rgba(0,0,0,.24)}.panel{padding:14px}.card{display:block;padding:13px}.card:hover{border-color:var(--line2);transform:translateY(-1px);transition:transform .16s ease,border-color .16s ease}
@@ -972,15 +968,21 @@ a{color:inherit;text-decoration:none}
 .source-diffs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0;color:var(--dim);font-size:11px}.source-diff{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:2px 6px;background:rgba(5,12,22,.22)}.source-diff b{color:var(--text);font-size:10px}.source-diff em{font-style:normal;font-family:var(--mono);font-size:10px}
 .opp-row{display:grid;grid-template-columns:1.7fr .68fr .72fr .7fr .78fr .8fr .74fr .92fr;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}.opp-row:last-child{border-bottom:0}.probability-row{grid-template-columns:1.9fr .58fr .58fr .58fr .62fr .62fr .56fr}.opp-title{font-weight:760}.opp-note{font-size:12px;color:var(--dim);margin-top:4px}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px 9px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:550;font-size:12px}td.num,th.num{text-align:right}.dim{color:var(--dim)}.pos{color:var(--lime)}.neg{color:var(--red)}
-.ai-brief{position:fixed;right:22px;bottom:20px;width:344px;z-index:30}.ai-brief summary{list-style:none;display:flex;gap:8px;align-items:center;border:1px solid var(--line2);background:rgba(12,24,43,.94);border-radius:999px;padding:10px 12px;box-shadow:0 18px 50px rgba(0,0,0,.30);cursor:pointer}.ai-brief summary::-webkit-details-marker{display:none}.spark-dot{width:9px;height:9px;border-radius:50%;background:var(--cyan);box-shadow:0 0 16px var(--cyan)}.brief-list{margin-top:10px;background:rgba(8,17,30,.96);border:1px solid var(--line);border-radius:8px;padding:8px;backdrop-filter:blur(18px)}.brief-item{padding:9px;border-bottom:1px solid var(--line);position:relative}.brief-item:last-child{border-bottom:0}.brief-item p{margin:4px 0;color:var(--dim);font-size:12px}.brief-tag{font-size:11px;color:var(--cyan)}
+.brief-item{padding:9px;border-bottom:1px solid var(--line);position:relative}.brief-item:last-child{border-bottom:0}.brief-item p{margin:4px 0;color:var(--dim);font-size:12px}.brief-tag{font-size:11px;color:var(--cyan)}
 .proof-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.proof-grid div{border:1px solid var(--line);border-radius:7px;padding:9px;background:rgba(5,12,22,.28)}.proof-grid span{display:block;color:var(--dim);font-size:11px}.proof-grid b{display:block;margin-top:4px;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis}.proof-blob{grid-column:1/-1}
 .match-hero{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding:18px;background:linear-gradient(135deg,rgba(67,199,255,.09),rgba(139,124,246,.09)),linear-gradient(180deg,rgba(15,28,47,.9),rgba(8,18,31,.86));border:1px solid var(--line);border-radius:8px}.team-badge{display:flex;align-items:center;gap:12px}.team-badge.away{justify-content:flex-end}.team-badge span{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:900;border:1px solid var(--line2);background:rgba(67,199,255,.10);color:var(--text)}.team-badge.away span{background:rgba(139,124,246,.12)}.team-badge b{font-size:20px}.countdown{text-align:center}.countdown strong{display:block;font-family:var(--mono);font-size:25px}.meta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:10px}.meta-grid div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}.meta-grid span{display:block;color:var(--dim);font-size:11px}.meta-grid b{display:block;margin-top:3px;font-size:12px}.review-scoreboard{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;border:1px solid var(--line2);border-radius:8px;background:rgba(67,199,255,.07);padding:12px;margin-bottom:10px}.review-scoreboard div{display:flex;align-items:baseline;gap:10px}.review-scoreboard div:last-child{justify-content:flex-end}.review-scoreboard span{color:var(--dim)}.review-scoreboard b{font:900 34px/1 var(--mono)}.review-scoreboard strong{color:var(--cyan);font-size:12px;text-align:center}.review-scoreboard.empty strong{max-width:520px;color:var(--dim);font-weight:550}.event-timeline{display:grid;gap:7px}.event-timeline.empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px;color:var(--dim)}.event-item{display:grid;grid-template-columns:58px 46px minmax(0,1fr);gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.18);padding:8px}.event-item.goal{border-color:rgba(244,189,80,.30);background:rgba(244,189,80,.07)}.event-item b{font-family:var(--mono);color:var(--amber)}.event-item p{margin:0;color:var(--dim);font-size:12px}
+.review-controls{margin-top:14px;display:grid;gap:10px}.review-controls .rv-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.review-controls .rv-label{color:var(--dim);font-size:12px;min-width:42px}.review-controls .rv-chips{display:flex;gap:6px;flex-wrap:wrap}.review-controls .chip{cursor:pointer}.chip.active{background:rgba(67,199,255,.18);border-color:var(--line2);color:#fff}.rv-sort-label{margin-left:auto;color:var(--dim);font-size:12px;display:flex;align-items:center;gap:6px}.rv-sort-label select{height:30px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 8px}#rv-search{flex:1;min-width:200px;height:32px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 10px}
+.review-card{border:1px solid var(--line);border-radius:8px;background:var(--panel)}.review-card>summary{list-style:none;cursor:pointer;padding:13px 15px;display:grid;gap:8px}.review-card>summary::-webkit-details-marker{display:none}.review-card[open]>summary{border-bottom:1px solid var(--line)}.rv-card-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rv-card-top .rv-title{font-weight:750;font-size:15px}.rv-card-score{margin-left:auto;font-family:var(--mono);font-weight:800;font-size:16px}.rv-card-metrics{display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:12px}.rv-card-metrics b{color:var(--text);font-family:var(--mono)}.rv-card-summary-line{color:var(--dim);font-size:12px}.review-detail{padding:13px 15px;display:grid;gap:13px}.review-detail .rv-h3{margin:0 0 8px;font-size:13px;color:var(--text)}.rv-three{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.rv-three>div{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px}.rv-three span{display:block;color:var(--cyan);font-size:11px;margin-bottom:5px}.rv-three p{margin:0;color:var(--dim);font-size:12px;line-height:1.55}.reaction-table .yes{color:var(--lime)}.reaction-table .no{color:var(--red)}.rv-trend{display:grid;gap:8px}.rv-trend-bar{display:flex;gap:14px;flex-wrap:wrap}.rv-toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}.rv-toggle button{background:transparent;border:0;color:var(--dim);font-size:12px;padding:5px 10px;cursor:pointer;border-right:1px solid var(--line)}.rv-toggle button:last-child{border-right:0}.rv-toggle button.active{background:rgba(67,199,255,.18);color:#fff}
+.opp-controls{margin-top:14px;display:grid;gap:10px}.opp-controls .rv-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.opp-controls .rv-label{color:var(--dim);font-size:12px;min-width:42px}.opp-controls .rv-chips{display:flex;gap:6px;flex-wrap:wrap}.opp-controls .chip{cursor:pointer}#op-search{flex:1;min-width:200px;height:32px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 10px}
+.opp-card{display:grid;grid-template-columns:64px minmax(170px,1.25fr) minmax(200px,1fr) minmax(190px,.95fr) auto;gap:16px;align-items:center;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.opp-c-score{display:grid;justify-items:center;gap:4px}.opp-c-score span{font-size:10px;color:var(--dim)}.opp-c-title{font-weight:750;font-size:16px}.opp-c-id .opp-note{margin-top:3px}.opp-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.opp-ai{margin-top:7px;color:var(--dim);font-size:12px;line-height:1.5}.opp-price-line{display:flex;align-items:center;gap:8px}.opp-price{font:800 18px/1 var(--mono)}.opp-spark{margin-left:auto}.opp-bar{display:grid;gap:5px;margin-top:9px}.opp-bar .bar-row{display:grid;grid-template-columns:52px 1fr 46px;align-items:center;gap:7px;font-size:11px;color:var(--dim)}.opp-bar .bar-track{height:6px;border-radius:999px;background:rgba(149,174,205,.16);overflow:hidden}.opp-bar .bar-fill{height:100%}.opp-bar .bar-row b{font-family:var(--mono);color:var(--text);text-align:right}.opp-bar .bar-foot{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--dim);margin-top:3px}.opp-bar .bar-foot b{font-family:var(--mono)}.opp-metrics{display:grid;grid-template-columns:repeat(3,auto);gap:8px 16px;font-size:11px;color:var(--dim)}.opp-metrics b{display:block;color:var(--text);font-family:var(--mono);font-size:12px;margin-top:2px}.opp-c-act{display:grid;gap:8px;justify-items:end;align-content:center}.opp-action{font-size:11px;color:var(--cyan)}
+@media(max-width:980px){.opp-card{grid-template-columns:56px minmax(0,1fr)}.opp-c-mid,.opp-c-metrics,.opp-c-act{grid-column:1/-1}.opp-c-act{justify-items:start}}
+@media(max-width:760px){.rv-three{grid-template-columns:1fr}.rv-sort-label{margin-left:0;width:100%}}
 .risk-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.risk-item{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);padding:10px}.risk-item .r-title{font-size:12px;color:var(--dim)}.risk-item .r-value{font-family:var(--mono);font-size:20px;margin:5px 0}
 .chart-grid{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:12px}.chart-cell{min-width:0;overflow:hidden}.chart-cell svg{display:block;width:100%;height:auto;max-width:100%}.chart-title{font-size:12px;color:var(--dim);margin-bottom:4px}.legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin:4px 0 10px;flex-wrap:wrap}.legend i{display:inline-block;width:14px;height:3px;margin-right:4px;vertical-align:middle}
 footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
 @media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid{grid-template-columns:minmax(0,1fr)}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.plan-config{grid-template-columns:repeat(3,minmax(0,1fr))}.plan-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.ai-brief{position:static;width:auto;margin-top:12px}.match-hero,.review-scoreboard{grid-template-columns:1fr;text-align:left}.team-badge.away,.review-scoreboard div:last-child{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row,.plan-bet-card{grid-template-columns:1fr}.plan-progress{display:grid}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-nav{overflow-x:auto;max-width:100%}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}.event-item{grid-template-columns:50px 42px minmax(0,1fr)}}
-@media (max-width:520px){.metric-strip{grid-template-columns:1fr}.side-nav a b{display:none}.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}}
+@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.match-hero,.review-scoreboard{grid-template-columns:1fr;text-align:left}.team-badge.away,.review-scoreboard div:last-child{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row,.plan-bet-card{grid-template-columns:1fr}.plan-progress{display:grid}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}.event-item{grid-template-columns:50px 42px minmax(0,1fr)}}
+@media (max-width:520px){.metric-strip{grid-template-columns:1fr}.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}}
 </style>
 </head>
 <body>
@@ -1352,8 +1354,18 @@ function alertsPanel(locale: Locale): string {
       const outcomeLabelText = outcome === "主胜" ? "Home" : outcome === "客胜" ? "Away" : outcome === "平" ? "Draw" : outcome;
       return `Line move ${team(locale, home)} vs ${team(locale, away)} (${stateLabel}): ${outcomeLabelText} ${rest}`;
     }
+    const edge = title.match(/^体彩(避坑|划算)\s+(.+?)\s+vs\s+(.+?)\s+(.+?):\s+体彩\s+(.+?)\s+vs\s+共识\s+(.+)$/);
+    if (edge) {
+      const [, dir, home, away, outcome, sptPct, consPct] = edge;
+      const dirLabel = dir === "避坑" ? "avoid" : "value";
+      const outcomeLabelText = outcome === "平" ? "Draw" : team(locale, outcome);
+      return `Sporttery ${dirLabel} ${team(locale, home)} vs ${team(locale, away)} ${outcomeLabelText}: Sporttery ${sptPct} vs consensus ${consPct}`;
+    }
     return title
       .replaceAll("盘口突变", "Line move")
+      .replaceAll("体彩", "Sporttery")
+      .replaceAll("共识", "consensus")
+      .replaceAll("书商", "Books")
       .replaceAll("进行中", "live")
       .replaceAll("主胜", "Home")
       .replaceAll("客胜", "Away")
@@ -1433,7 +1445,7 @@ export function boardPage(locale: Locale = "zh"): string {
   return page(locale, "home", t.heroTitle, body, model);
 }
 
-function readWalrusManifest(): Record<string, unknown> | null {
+export function readWalrusManifest(): Record<string, unknown> | null {
   const path = join(WALRUS_FEED_DIR, "manifest-latest.json");
   if (!existsSync(path)) return null;
   try {
@@ -1463,6 +1475,14 @@ function walrusManifestHref(): string | null {
   return blob ? walrusBlobHref(blob) : null;
 }
 
+function decodePath(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 function walrusArtifactsTable(locale: Locale, manifest: Record<string, unknown> | null): string {
   const artifacts = Array.isArray(manifest?.artifacts) ? (manifest.artifacts as Record<string, unknown>[]) : [];
   if (!artifacts.length) return `<p class="dim">${locale === "zh" ? "本地 manifest 尚未生成。" : "No local manifest yet."}</p>`;
@@ -1472,7 +1492,7 @@ function walrusArtifactsTable(locale: Locale, manifest: Record<string, unknown> 
       const blob = typeof walrus.blob_id === "string" ? walrus.blob_id : "";
       const hrefBlob = blob ? walrusBlobHref(blob) : null;
       return (
-        `<tr><td>${esc(String(artifact.relativePath ?? artifact.name ?? "-"))}</td>` +
+        `<tr><td>${esc(decodePath(String(artifact.relativePath ?? artifact.name ?? "-")))}</td>` +
         `<td class="num">${money(Number(artifact.bytes ?? 0), 0)}</td>` +
         `<td class="mono">${esc(String(artifact.sha256 ?? "-")).slice(0, 18)}</td>` +
         `<td class="mono">${hrefBlob ? `<a href="${esc(hrefBlob)}">${esc(blob.slice(0, 18))}</a>` : esc(blob ? blob.slice(0, 18) : "-")}</td>` +
@@ -1559,40 +1579,486 @@ export function walrusPage(locale: Locale = "zh"): string {
   return page(locale, "walrus", "Walrus Data · WC Radar", body, model, 120, "/walrus");
 }
 
+// 机会榜风险中文映射:low→低风险 / watch→中风险 / elevated→高风险 / insufficient→数据不足。内部 RiskLevel 不变。
+function oppRiskBadge(locale: Locale, level: RiskLevel): string {
+  const map: Record<RiskLevel, { zh: string; en: string; cls: string }> = {
+    low: { zh: "低风险", en: "Low risk", cls: "low" },
+    watch: { zh: "中风险", en: "Medium risk", cls: "watch" },
+    elevated: { zh: "高风险", en: "High risk", cls: "bad" },
+    insufficient: { zh: "数据不足", en: "Insufficient", cls: "mute" },
+  };
+  const m = map[level];
+  return `<span class="badge ${m.cls}">${esc(locale === "zh" ? m.zh : m.en)}</span>`;
+}
+
+function oppCloseLabel(locale: Locale, iso: string, live: boolean): string {
+  if (live) return COPY[locale].labels.live;
+  const h = (Date.parse(iso) - Date.now()) / 3600_000;
+  if (!Number.isFinite(h) || h <= 0) return locale === "zh" ? "已封盘" : "closed";
+  if (h >= 48) return locale === "zh" ? `${Math.round(h / 24)} 天` : `${Math.round(h / 24)}d`;
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
+  return `${hh}h ${mm}m`;
+}
+
+// 该机会对应赛果的 PM 近 24h 走势(按 outcome 取概率)。
+function oppSpark(locale: Locale, o: MarketOpportunity): string {
+  const pm = getLineHistory(o.fixtureKey, { hours: 24, bucketMinutes: 30, sources: ["polymarket"] })[0];
+  const emptyLabel = locale === "zh" ? "走势积累中" : "Trend pending";
+  if (!pm || pm.points.length < 2) return sparkline([], { width: 132, height: 30, emptyLabel });
+  return sparkline(pm.points.map((p) => p.probs[o.outcome]), { width: 132, height: 30, emptyLabel });
+}
+
+function oppCardTitle(locale: Locale, o: MarketOpportunity): string {
+  if (o.outcome === "draw") return outcomeLabel(locale, "draw");
+  return locale === "zh" ? `${team(locale, o.outcomeName)}胜` : `${team(locale, o.outcomeName)} win`;
+}
+
+// 模板点评:把"模型估计"作为核心,诚实标注模型偏离方向与风险。不写"AI 估计"。
+function oppNote(locale: Locale, o: MarketOpportunity): string {
+  const dev = o.modelDeviationPp;
+  if (locale === "zh") {
+    const sig = o.tags.includes("high_heat") ? "高热度" : o.tags.includes("high_liquidity") ? "深流动性" : "盘口活跃";
+    const m =
+      dev === null
+        ? "模型样本不足，暂不给偏离"
+        : Math.abs(dev) < 2
+          ? "模型与市场基本一致"
+          : dev > 0
+            ? `模型比市场高 ${dev.toFixed(1)}pp，可能被低估`
+            : `模型比市场低 ${(-dev).toFixed(1)}pp，可能被高估`;
+    const r = o.riskLevel === "elevated" ? "但风险偏高，注意追高" : o.riskLevel === "insufficient" ? "但数据质量不足" : "风险可控";
+    return `${sig}；${m}；${r}。`;
+  }
+  const sig = o.tags.includes("high_heat") ? "High heat" : o.tags.includes("high_liquidity") ? "Deep liquidity" : "Active market";
+  const m =
+    dev === null
+      ? "model sample too thin for an edge"
+      : Math.abs(dev) < 2
+        ? "model roughly matches market"
+        : dev > 0
+          ? `model ${dev.toFixed(1)}pp above market (possible underpricing)`
+          : `model ${(-dev).toFixed(1)}pp below market (possible overpricing)`;
+  const r = o.riskLevel === "elevated" ? "but risk is elevated" : o.riskLevel === "insufficient" ? "but data is thin" : "risk is contained";
+  return `${sig}; ${m}; ${r}.`;
+}
+
+// 市场隐含 vs 模型估计 双进度条 + 模型偏离 + 跨平台分歧。
+function oppBars(locale: Locale, o: MarketOpportunity): string {
+  const barRow = (label: string, value: number | null, color: string): string =>
+    `<div class="bar-row"><span>${esc(label)}</span><div class="bar-track"><div class="bar-fill" style="width:${value !== null ? (value * 100).toFixed(1) : 0}%;background:${color}"></div></div><b>${pct(value, 1)}</b></div>`;
+  const dev = o.modelDeviationPp;
+  const devCls = dev === null ? "dim" : dev > 0 ? "pos" : dev < 0 ? "neg" : "dim";
+  const devStr = dev === null ? "-" : `${signedPp(dev)}pp`;
+  return (
+    `<div class="opp-bar">` +
+    barRow(locale === "zh" ? "市场隐含" : "Market", o.marketImpliedProbability, "var(--cyan)") +
+    barRow(locale === "zh" ? "模型估计" : "Model", o.modelEstimatedProbability, "var(--violet)") +
+    `<div class="bar-foot"><span>${locale === "zh" ? "模型偏离" : "Model dev"} <b class="${devCls}">${devStr}</b></span><span>${locale === "zh" ? "跨平台分歧" : "Cross-platform"} <b>${o.maxCrossPlatformProbabilityGap.toFixed(1)}pp</b></span></div>` +
+    `</div>`
+  );
+}
+
+function oppMetrics(locale: Locale, o: MarketOpportunity): string {
+  const cell = (label: string, val: string): string => `<div><span>${esc(label)}</span><b>${esc(val)}</b></div>`;
+  return (
+    `<div class="opp-metrics">` +
+    cell(locale === "zh" ? "24H量" : "24h Vol", compactMoney(o.volume24h)) +
+    cell(locale === "zh" ? "流动性" : "Liquidity", compactMoney(o.liquidity)) +
+    cell(locale === "zh" ? "价差" : "Spread", percent(o.bidAskSpread, 1)) +
+    cell(locale === "zh" ? "参与人数" : "Traders", compactNumber(o.activeTraders24h)) +
+    cell(locale === "zh" ? "封盘" : "Closes", oppCloseLabel(locale, o.closeTime, o.live)) +
+    cell(locale === "zh" ? "置信度" : "Confidence", String(Math.round(o.confidenceScore))) +
+    `</div>`
+  );
+}
+
+function opportunityCardV2(locale: Locale, o: MarketOpportunity): string {
+  const t = COPY[locale];
+  const matchN = matchName(locale, o.homeTeam, o.awayTeam);
+  const closeH = (Date.parse(o.closeTime) - Date.now()) / 3600_000;
+  const priceStr = o.currentPrice !== null ? o.currentPrice.toFixed(2) : "-";
+  const subline = `${esc(matchN)} · ${esc(o.platform)} · ${esc(marketTypeLabel(locale, o.marketType))} · ${esc(outcomeLabel(locale, o.outcome))}`;
+  return (
+    `<article class="opp-card" data-platform="${o.platform.toLowerCase()}" data-playtype="${o.playType}" data-risk="${o.riskLevel}" data-signals="${esc(o.tags.join(" "))}" data-score="${o.opportunityScore.toFixed(2)}" data-deviation="${o.modelDeviationPp === null ? 0 : Math.abs(o.modelDeviationPp).toFixed(2)}" data-liquidity="${o.liquidity ?? 0}" data-close="${Number.isFinite(closeH) ? closeH.toFixed(2) : 99999}" data-search="${esc((o.homeTeam + " " + o.awayTeam + " " + o.outcomeName).toLowerCase())}">` +
+    `<div class="opp-c-score">${scoreRing(o.opportunityScore, t.labels.score)}<span>${locale === "zh" ? "机会评分" : "Score"}</span></div>` +
+    `<div class="opp-c-id"><div class="opp-c-title">${esc(oppCardTitle(locale, o))}</div><div class="opp-note">${subline}</div><div class="opp-tags">${tagList(locale, o.tags, 4)}</div><div class="opp-ai">${esc(oppNote(locale, o))}</div></div>` +
+    `<div class="opp-c-mid"><div class="opp-price-line"><span class="dim">${esc(t.labels.price)}</span><b class="opp-price">${priceStr}</b><span class="opp-spark">${oppSpark(locale, o)}</span></div>${oppBars(locale, o)}</div>` +
+    `<div class="opp-c-metrics">${oppMetrics(locale, o)}</div>` +
+    `<div class="opp-c-act">${oppRiskBadge(locale, o.riskLevel)}<span class="opp-action">${esc(ACTION_LABELS[locale][o.suggestedAction])}</span></div>` +
+    `</article>`
+  );
+}
+
+function opportunityControls(locale: Locale, count: number): string {
+  const chip = (val: string, label: string, active = false): string =>
+    `<button type="button" class="chip${active ? " active" : ""}" data-op-val="${val}">${esc(label)}</button>`;
+  const platformChips = [chip("all", locale === "zh" ? "全部" : "All", true), chip("polymarket", "Polymarket")].join("");
+  const riskChips = [
+    chip("all", locale === "zh" ? "全部" : "All", true),
+    chip("low", locale === "zh" ? "低风险" : "Low"),
+    chip("watch", locale === "zh" ? "中风险" : "Medium"),
+    chip("elevated", locale === "zh" ? "高风险" : "High"),
+    chip("no-elevated", locale === "zh" ? "排除高风险" : "Exclude high"),
+  ].join("");
+  const playChips = [chip("all", locale === "zh" ? "全部" : "All", true), chip("match_winner", locale === "zh" ? "胜平负" : "Match winner")].join("");
+  const signalChips = (
+    [
+      ["all", locale === "zh" ? "全部" : "All"],
+      ["high_heat", locale === "zh" ? "高热度" : "High heat"],
+      ["high_liquidity", locale === "zh" ? "高流动性" : "High liquidity"],
+      ["odds_divergence", locale === "zh" ? "赔率分歧" : "Odds divergence"],
+      ["model_edge", locale === "zh" ? "模型偏离" : "Model edge"],
+      ["closing_soon", locale === "zh" ? "即将封盘" : "Closing soon"],
+    ] as [string, string][]
+  )
+    .map(([v, l], i) => chip(v, l, i === 0))
+    .join("");
+  const sortOpts = (
+    [
+      ["score", locale === "zh" ? "综合机会评分" : "Opportunity score"],
+      ["deviation", locale === "zh" ? "模型偏离" : "Model deviation"],
+      ["liquidity", locale === "zh" ? "流动性" : "Liquidity"],
+      ["close", locale === "zh" ? "即将封盘" : "Closing soon"],
+    ] as [string, string][]
+  )
+    .map(([v, l]) => `<option value="${v}">${esc(l)}</option>`)
+    .join("");
+  return (
+    `<section class="panel opp-controls">` +
+    `<div class="rv-row"><input id="op-search" placeholder="${locale === "zh" ? "搜索球队 / 赛果" : "Search team / outcome"}"><label class="rv-sort-label">${locale === "zh" ? "排序" : "Sort"} <select id="op-sort">${sortOpts}</select></label></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "平台" : "Platform"}</span><div class="rv-chips" data-op-group="platform">${platformChips}</div></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "风险" : "Risk"}</span><div class="rv-chips" data-op-group="risk">${riskChips}</div></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "玩法" : "Type"}</span><div class="rv-chips" data-op-group="playtype">${playChips}</div></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "信号" : "Signal"}</span><div class="rv-chips" data-op-group="signal">${signalChips}</div></div>` +
+    `<div class="rv-row dim" style="font-size:12px">${locale === "zh" ? "共" : "Total"} <b id="op-count" style="color:var(--text);margin:0 4px">${count}</b> ${locale === "zh" ? "个池子" : "markets"}</div>` +
+    `</section>`
+  );
+}
+
+function oppFilterSortScript(): string {
+  return `<script>
+(function(){
+  var state={platform:"all",risk:"all",playtype:"all",signal:"all",q:""},sort="score";
+  var list=document.getElementById("opp-list"); if(!list) return;
+  var cards=[].slice.call(list.querySelectorAll(".opp-card"));
+  function pass(c){
+    if(state.platform!=="all" && c.getAttribute("data-platform")!==state.platform) return false;
+    if(state.playtype!=="all" && c.getAttribute("data-playtype")!==state.playtype) return false;
+    if(state.risk==="no-elevated"){ if(c.getAttribute("data-risk")==="elevated") return false; }
+    else if(state.risk!=="all" && c.getAttribute("data-risk")!==state.risk) return false;
+    if(state.signal!=="all" && (" "+(c.getAttribute("data-signals")||"")+" ").indexOf(" "+state.signal+" ")<0) return false;
+    if(state.q && (c.getAttribute("data-search")||"").indexOf(state.q)<0) return false;
+    return true;
+  }
+  function key(c){
+    if(sort==="deviation") return parseFloat(c.getAttribute("data-deviation")||"0");
+    if(sort==="liquidity") return parseFloat(c.getAttribute("data-liquidity")||"0");
+    if(sort==="close") return -parseFloat(c.getAttribute("data-close")||"99999");
+    return parseFloat(c.getAttribute("data-score")||"0");
+  }
+  function apply(){
+    var vis=[];
+    cards.forEach(function(c){ var p=pass(c); c.style.display=p?"":"none"; if(p) vis.push(c); });
+    vis.sort(function(a,b){ return key(b)-key(a); });
+    vis.forEach(function(c){ list.appendChild(c); });
+    var n=document.getElementById("op-count"); if(n) n.textContent=String(vis.length);
+  }
+  document.querySelectorAll("[data-op-group]").forEach(function(group){
+    var g=group.getAttribute("data-op-group");
+    group.querySelectorAll("[data-op-val]").forEach(function(chip){
+      chip.addEventListener("click",function(){
+        group.querySelectorAll("[data-op-val]").forEach(function(x){ x.classList.remove("active"); });
+        chip.classList.add("active");
+        state[g]=chip.getAttribute("data-op-val");
+        apply();
+      });
+    });
+  });
+  var s=document.getElementById("op-search"); if(s) s.addEventListener("input",function(){ state.q=s.value.trim().toLowerCase(); apply(); });
+  var so=document.getElementById("op-sort"); if(so) so.addEventListener("change",function(){ sort=so.value; apply(); });
+  apply();
+})();
+</script>`;
+}
+
 export function opportunitiesPage(locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
   const t = COPY[locale];
   const body =
-    `<section class="panel" style="margin-top:16px"><div class="hero-title">${esc(t.opportunities)}</div><p class="hero-sub">${locale === "zh" ? "单一风险调整评分，综合 Polymarket liquidity、24h volume、spread、top holder depth、active traders、跨平台赔率分歧和数据质量惩罚。" : "A single risk-adjusted ranking using real Polymarket liquidity, 24h volume, spread, top holder depth, active trader observations, cross-platform odds divergence, and data-quality penalties."}</p></section>` +
+    `<section class="panel" style="margin-top:16px"><div class="hero-title">${esc(t.opportunities)}</div><p class="hero-sub">${locale === "zh" ? "热度、流动性、赔率分歧、模型概率偏离与风险惩罚,合并为统一的机会评分。模型估计来自书商中位 + Pinnacle + PM + Kalshi 的透明加权,不是 AI。" : "Heat, liquidity, odds divergence, model-vs-market probability gap, and risk penalty combine into one opportunity score. The model estimate is a transparent weighted blend (book median + Pinnacle + PM + Kalshi), not AI."}</p></section>` +
     metricStrip(locale, model) +
-    `<section><div class="section-head"><h2>${esc(t.sections.ranking)}<small>${esc(t.sections.rankingSub)}</small></h2><span class="dim">${model.opportunities.length} ${esc(t.labels.rows)}</span></div><div class="panel">${model.opportunities.map((o) => opportunityRow(locale, o)).join("")}</div></section>` +
+    opportunityControls(locale, model.opportunities.length) +
+    `<section id="opp-list" style="margin-top:14px;display:grid;gap:12px">${model.opportunities.length ? model.opportunities.map((o) => opportunityCardV2(locale, o)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "暂无机会数据。" : "No opportunity data yet."}</p></div>`}</section>` +
+    oppFilterSortScript() +
     walrusProof(locale) +
     `<footer>${esc(t.oppFooter)}</footer>`;
   return page(locale, "opportunities", `${t.opportunities} · WC Radar`, body, model);
 }
 
-function reviewMatchPanel(locale: Locale, row: CurrentOddsRow): string {
-  const history = reviewHistory(row);
-  const bundle = getMatchEventBundle(row.fixtureKey);
-  const markers = reviewGoalMarkers(locale, row, bundle);
-  const kickoff = new Date(row.kickoffUtc);
-  const title = matchNameFromRow(locale, row);
+const REVIEW_QUALITY_LABELS: Record<Locale, Record<ReviewQuality, string>> = {
+  zh: { complete: "完整复盘", odds_only: "赔率复盘", no_goal_events: "无进球事件", insufficient: "数据不足", no_turn: "无明显转折" },
+  en: { complete: "Full review", odds_only: "Odds-only", no_goal_events: "No goal events", insufficient: "Insufficient data", no_turn: "No clear turn" },
+};
+
+function reviewQualityLabel(locale: Locale, q: ReviewQuality): string {
+  return REVIEW_QUALITY_LABELS[locale][q];
+}
+
+function reviewQualityClass(q: ReviewQuality): string {
+  if (q === "complete") return "low";
+  if (q === "odds_only") return "info";
+  if (q === "insufficient") return "watch";
+  return "mute";
+}
+
+// 最新一组多源概率里,任一向上的跨源最大-最小差(pp),用于"平台分歧最大"排序。
+function reviewDivergencePp(row: CurrentOddsRow): number {
+  const sources = Object.values(row.sourceOdds);
+  if (sources.length < 2) return 0;
+  let mx = 0;
+  for (const label of LABELS) {
+    const vals = sources.map((s) => s[label]);
+    mx = Math.max(mx, (Math.max(...vals) - Math.min(...vals)) * 100);
+  }
+  return mx;
+}
+
+function reviewJumpList(locale: Locale, jumps: ReviewJump[]): string {
+  if (!jumps.length) return `<p class="dim">${locale === "zh" ? "没有 ≥2pp 的相邻窗口跳变。" : "No ≥2pp adjacent-bucket jumps."}</p>`;
+  return jumps
+    .map(
+      (j) =>
+        `<div class="muted-line"><span class="badge ${sourcePriority(j.source) < 9 ? "info" : "mute"}">${esc(j.source)}</span>${esc(outcomeLabel(locale, j.label))} <b class="${j.deltaPp >= 0 ? "pos" : "neg"}">${signedPp(j.deltaPp)}pp</b> @ ${esc(fullTime(locale, new Date(j.ts)))}</div>`
+    )
+    .join("");
+}
+
+// 三段式:市场发生了什么 / 可能为什么 / 应该怎么看。全部从已算好的 ReviewMatch 字段模板化。
+function reviewThreeSection(locale: Locale, m: ReviewMatch): string {
+  const top = m.topJumps[0];
+  const pmMove = reviewPmMove(locale, m.row, m.history, m.bundle);
+  let what: string;
+  if (top) {
+    const head = `${top.source} ${outcomeLabel(locale, top.label)} ${signedPp(top.deltaPp)}pp @ ${fullTime(locale, new Date(top.ts))}`;
+    what = locale === "zh" ? `最大转折:${head}。${pmMove}。` : `Biggest turn: ${head}. ${pmMove}.`;
+  } else {
+    what = locale === "zh" ? `本场没有 ≥2pp 的明显跳变。${pmMove}。` : `No ≥2pp move this match. ${pmMove}.`;
+  }
+  const phrase = top ? nearestGoalPhrase(locale, m.row, m.bundle, top.ts) : "";
+  let why: string;
+  if (phrase) {
+    why = locale === "zh" ? `盘口转折与进球时间对齐${phrase}。` : `The move lines up with a goal${phrase}.`;
+  } else if (m.goals.length) {
+    why = locale === "zh" ? "转折与进球时间未对齐,更可能来自红牌、伤停或资金面。" : "The move doesn't align with goals; more likely cards, injuries, or order flow.";
+  } else {
+    why = locale === "zh" ? "当前无进球事件数据,无法把转折归因到具体比赛事件。" : "No goal-event data, so the move can't be tied to a specific in-match event.";
+  }
+  const withWinner = m.reaction.filter((r) => r.closeToResult !== "na");
+  const hit = withWinner.filter((r) => r.closeToResult === "yes").length;
+  const qNote = reviewQualityLabel(locale, m.quality);
+  let how: string;
+  if (m.winner && withWinner.length) {
+    how =
+      locale === "zh"
+        ? `${qNote};${hit}/${withWinner.length} 个平台终值把${outcomeLabel(locale, m.winner)}排为最高概率。`
+        : `${qNote}; ${hit}/${withWinner.length} platforms ended with ${outcomeLabel(locale, m.winner)} as top pick.`;
+  } else {
+    how = locale === "zh" ? `${qNote};无官方比分,结论仅供参考。` : `${qNote}; no official score, treat as indicative only.`;
+  }
   return (
-    `<section class="panel review-panel">` +
-    `<div class="panel-head"><h2><a href="${href("/match", locale, { fk: row.fixtureKey })}">${esc(title)}</a></h2><span class="badge ${bundle.result ? "low" : "mute"}">${bundle.result ? esc(resultStatusLabel(locale, bundle.result.status)) : locale === "zh" ? "已结束 inferred" : "Completed inferred"}</span></div>` +
-    reviewScoreboard(locale, row, bundle) +
-    `<div class="meta-grid review-meta"><div><span>${locale === "zh" ? "开赛" : "Kickoff"}</span><b>${esc(fullTime(locale, kickoff))} CST</b></div><div><span>${locale === "zh" ? "关键转折点" : "Key turn"}</span><b>${esc(reviewKeyTurn(locale, row, history, bundle))}</b></div><div><span>${locale === "zh" ? "PM 人话解释" : "PM plain read"}</span><b>${esc(reviewPmMove(locale, row, history, bundle))}</b></div><div><span>${locale === "zh" ? "进球时间轴" : "Goal timeline"}</span><b>${markers.length ? `${markers.length} ${locale === "zh" ? "个进球标记" : "goal markers"}` : locale === "zh" ? "暂无" : "None"}</b></div><div><span>${locale === "zh" ? "赛果来源" : "Result source"}</span><b>${esc(bundle.result?.source ?? (API_FOOTBALL_KEY ? "api_football pending" : "not configured"))}</b></div></div>` +
-    `<div style="margin-top:12px">${reviewTimeline(locale, row, bundle)}</div>` +
-    `<div style="margin-top:12px">${reviewTrendChart(locale, row, history, markers)}</div>` +
-    `<details class="details-panel"><summary>${locale === "zh" ? "全部来源异常跳变" : "All source jumps"}</summary><div style="margin-top:8px">${reviewAllJumps(locale, history)}</div></details>` +
-    `<details class="details-panel"><summary>${locale === "zh" ? "查看最新多源概率表" : "Latest multi-source probabilities"}</summary><div style="margin-top:8px">${sourceTable(locale, row)}</div></details>` +
+    `<div class="rv-three">` +
+    `<div><span>${locale === "zh" ? "市场发生了什么" : "What happened"}</span><p>${esc(what)}</p></div>` +
+    `<div><span>${locale === "zh" ? "可能为什么" : "Why it may have happened"}</span><p>${esc(why)}</p></div>` +
+    `<div><span>${locale === "zh" ? "应该怎么看" : "How to read it"}</span><p>${esc(how)}</p></div>` +
+    `</div>`
+  );
+}
+
+function platformReactionTable(locale: Locale, m: ReviewMatch): string {
+  if (!m.reaction.length) return `<p class="dim">${locale === "zh" ? "暂无可对比的平台走势。" : "No comparable platform movement."}</p>`;
+  const rows = m.reaction
+    .map((r) => {
+      const core = sourcePriority(r.source) < 9;
+      const first = r.firstMoveTs ? esc(fullTime(locale, new Date(r.firstMoveTs))) : `<span class="dim">${locale === "zh" ? "无明显变化" : "no clear move"}</span>`;
+      const mag = r.maxDeltaPp > 0 ? `${r.maxDeltaPp.toFixed(1)}pp` : "—";
+      const close =
+        r.closeToResult === "yes"
+          ? `<span class="yes">${locale === "zh" ? "是" : "Yes"}</span>`
+          : r.closeToResult === "no"
+            ? `<span class="no">${locale === "zh" ? "否" : "No"}</span>`
+            : "—";
+      const fp = r.finalWinnerProb !== null ? ` <span class="dim">(${pct(r.finalWinnerProb, 0)})</span>` : "";
+      return `<tr><td><span class="badge ${core ? "info" : "mute"}">${esc(r.source)}</span></td><td>${first}</td><td class="num">${mag}</td><td class="num">${close}${fp}</td></tr>`;
+    })
+    .join("");
+  return `<table class="reaction-table"><tr><th>${locale === "zh" ? "平台" : "Platform"}</th><th>${locale === "zh" ? "首次明显变化" : "First move"}</th><th class="num">${locale === "zh" ? "最大幅度" : "Max move"}</th><th class="num">${locale === "zh" ? "终值贴近赛果" : "Ended on result"}</th></tr>${rows}</table>`;
+}
+
+// 多源概率表:核心源(PM/Kalshi/体彩/Pinnacle)+ 书商中位默认展示,其余书商折叠。
+function reviewSourceTable(locale: Locale, row: CurrentOddsRow): string {
+  const core = ["polymarket", "kalshi", "sporttery", "pinnacle"];
+  const coreEntries = core.filter((s) => row.sourceOdds[s]).map((s) => [s, row.sourceOdds[s]] as [string, ThreeWay]);
+  const restEntries = Object.entries(row.sourceOdds).filter(([s]) => !core.includes(s));
+  const diffCell = (label: Label, probs: ThreeWay): string => {
+    if (!row.bookAvg) return `<td class="num">${pct(probs[label])}</td>`;
+    const diff = (probs[label] - row.bookAvg[label]) * 100;
+    const cls = diff >= 2 ? "neg" : diff <= -2 ? "pos" : "dim";
+    return `<td class="num">${pct(probs[label])} <span class="${cls}" style="font-size:11px">${signedPp(diff)}</span></td>`;
+  };
+  const head = `<tr><th>${locale === "zh" ? "平台" : "Platform"}</th>${LABELS.map((label) => `<th class="num">${esc(outcomeName(locale, row, label))}</th>`).join("")}</tr>`;
+  const avgRow = row.bookAvg
+    ? `<tr style="font-weight:650"><td>${locale === "zh" ? "书商中位" : "Book median"} (${row.books})</td>${LABELS.map((label) => `<td class="num">${pct(row.bookAvg![label])}</td>`).join("")}</tr>`
+    : "";
+  const tr = ([source, probs]: [string, ThreeWay]): string => `<tr><td>${esc(source)}</td>${LABELS.map((label) => diffCell(label, probs)).join("")}</tr>`;
+  const coreTable = `<table>${head}${avgRow}${coreEntries.map(tr).join("")}</table>`;
+  const rest = restEntries.length
+    ? `<details class="details-panel"><summary>${locale === "zh" ? `展开全部平台(${restEntries.length} 家书商)` : `All platforms (${restEntries.length} books)`}</summary><table style="margin-top:8px">${head}${restEntries.map(tr).join("")}</table></details>`
+    : "";
+  return coreTable + rest;
+}
+
+function reviewControls(locale: Locale, count: number): string {
+  const chip = (val: string, label: string, active = false): string =>
+    `<button type="button" class="chip${active ? " active" : ""}" data-rv-val="${val}">${esc(label)}</button>`;
+  const platformChips = [
+    chip("all", locale === "zh" ? "全部" : "All", true),
+    chip("polymarket", "Polymarket"),
+    chip("kalshi", "Kalshi"),
+    chip("sporttery", locale === "zh" ? "体彩" : "Sporttery"),
+    chip("pinnacle", "Pinnacle"),
+    chip("book", locale === "zh" ? "书商" : "Books"),
+  ].join("");
+  const qualityKeys: ReviewQuality[] = ["complete", "odds_only", "no_goal_events", "no_turn", "insufficient"];
+  const qualityChips = [chip("all", locale === "zh" ? "全部" : "All", true), ...qualityKeys.map((q) => chip(q, reviewQualityLabel(locale, q)))].join("");
+  const turnChips = [chip("0", locale === "zh" ? "全部" : "All", true), chip("5", "≥5pp"), chip("10", "≥10pp"), chip("20", "≥20pp")].join("");
+  const sortOpts = (
+    [
+      ["turn", locale === "zh" ? "最大转折" : "Biggest turn"],
+      ["latest", locale === "zh" ? "最新比赛" : "Most recent"],
+      ["completeness", locale === "zh" ? "数据完整度" : "Completeness"],
+      ["prederr", locale === "zh" ? "预测偏差最大" : "Biggest miss"],
+      ["divergence", locale === "zh" ? "平台分歧最大" : "Most divergence"],
+    ] as [string, string][]
+  )
+    .map(([v, l]) => `<option value="${v}">${esc(l)}</option>`)
+    .join("");
+  return (
+    `<section class="panel review-controls">` +
+    `<div class="rv-row"><input id="rv-search" placeholder="${locale === "zh" ? "搜索球队 / 比赛" : "Search team / match"}"><label class="rv-sort-label">${locale === "zh" ? "排序" : "Sort"} <select id="rv-sort">${sortOpts}</select></label></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "平台" : "Platform"}</span><div class="rv-chips" data-rv-group="platform">${platformChips}</div></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "复盘" : "Type"}</span><div class="rv-chips" data-rv-group="quality">${qualityChips}</div></div>` +
+    `<div class="rv-row"><span class="rv-label">${locale === "zh" ? "转折" : "Turn"}</span><div class="rv-chips" data-rv-group="turn">${turnChips}</div></div>` +
+    `<div class="rv-row dim" style="font-size:12px">${locale === "zh" ? "共" : "Total"} <b id="rv-count" style="color:var(--text);margin:0 4px">${count}</b> ${locale === "zh" ? "场复盘" : "reviews"}</div>` +
     `</section>`
   );
 }
 
+function reviewCard(locale: Locale, m: ReviewMatch): string {
+  const row = m.row;
+  const bundle = m.bundle;
+  const markers = reviewGoalMarkers(locale, row, bundle);
+  const title = matchNameFromRow(locale, row);
+  const platforms = [...new Set(m.sources.map((s) => (sourcePriority(s) < 9 ? s : "book")))].join(" ");
+  const score =
+    bundle.result && bundle.result.homeScore !== null && bundle.result.awayScore !== null
+      ? `${bundle.result.homeScore}-${bundle.result.awayScore}`
+      : locale === "zh"
+        ? "比分待补"
+        : "No score";
+  const topTime = m.topJumps[0] ? fullTime(locale, new Date(m.topJumps[0].ts)) : "—";
+  const prederr = m.predictionErrorPp;
+  const h3 = (label: string): string => `<h3 class="rv-h3">${esc(label)}</h3>`;
+  const detail =
+    reviewScoreboard(locale, row, bundle) +
+    `<div>${reviewThreeSection(locale, m)}</div>` +
+    `<div>${h3(locale === "zh" ? "关键转折(Top 3)" : "Key turns (Top 3)")}${reviewJumpList(locale, m.topJumps)}<details class="details-panel"><summary>${locale === "zh" ? "展开全部异常跳变" : "All source jumps"}</summary><div style="margin-top:8px">${reviewJumpList(locale, m.allJumps.slice(0, 12))}</div></details></div>` +
+    `<div>${h3(locale === "zh" ? "平台反应速度" : "Platform reaction speed")}${platformReactionTable(locale, m)}</div>` +
+    `<div>${h3(locale === "zh" ? "概率走势" : "Probability trend")}${reviewTrendChart(locale, row, m.history, markers, m.winner ?? "home")}</div>` +
+    `<div>${reviewTimeline(locale, row, bundle)}</div>` +
+    `<div>${h3(locale === "zh" ? "多源概率" : "Multi-source probabilities")}${reviewSourceTable(locale, row)}</div>`;
+  return (
+    `<details class="review-card" data-search="${esc((row.homeTeam + " " + row.awayTeam + " " + title).toLowerCase())}" data-platforms="${esc(platforms)}" data-quality="${m.quality}" data-turn="${m.maxTurnPp.toFixed(2)}" data-kickoff="${Date.parse(row.kickoffUtc) || 0}" data-completeness="${m.completeness}" data-prederr="${prederr === null ? -1 : prederr.toFixed(2)}" data-divergence="${reviewDivergencePp(row).toFixed(2)}">` +
+    `<summary>` +
+    `<div class="rv-card-top"><span class="rv-title">${esc(title)}</span><span class="badge ${reviewQualityClass(m.quality)}">${esc(reviewQualityLabel(locale, m.quality))}</span><span class="rv-card-score">${esc(score)}</span></div>` +
+    `<div class="rv-card-metrics"><span>${locale === "zh" ? "最大转折" : "Max turn"} <b>${m.maxTurnPp.toFixed(1)}pp</b>${m.keyPlatform ? ` · ${esc(m.keyPlatform)}` : ""}</span><span>${locale === "zh" ? "转折时间" : "Turn time"} <b>${esc(topTime)}</b></span>${prederr !== null ? `<span>${locale === "zh" ? "赛前低估" : "Pre-match miss"} <b>${prederr.toFixed(0)}pp</b></span>` : ""}<span>${locale === "zh" ? "完整度" : "Completeness"} <b>${m.completeness}</b></span></div>` +
+    `<div class="rv-card-summary-line">${esc(reviewKeyTurn(locale, row, m.history, bundle))}</div>` +
+    `</summary>` +
+    `<div class="review-detail">${detail}</div>` +
+    `</details>`
+  );
+}
+
+function reviewFilterSortScript(): string {
+  return `<script>
+(function(){
+  var state={platform:"all",quality:"all",turn:0,q:""},sort="turn";
+  var list=document.getElementById("review-list");
+  if(!list) return;
+  var cards=[].slice.call(list.querySelectorAll(".review-card"));
+  function pass(c){
+    if(state.platform!=="all" && (" "+(c.getAttribute("data-platforms")||"")+" ").indexOf(" "+state.platform+" ")<0) return false;
+    if(state.quality!=="all" && c.getAttribute("data-quality")!==state.quality) return false;
+    if(state.turn>0 && parseFloat(c.getAttribute("data-turn")||"0")<state.turn) return false;
+    if(state.q && (c.getAttribute("data-search")||"").indexOf(state.q)<0) return false;
+    return true;
+  }
+  function key(c){
+    if(sort==="latest") return parseFloat(c.getAttribute("data-kickoff")||"0");
+    if(sort==="completeness") return parseFloat(c.getAttribute("data-completeness")||"0");
+    if(sort==="prederr") return parseFloat(c.getAttribute("data-prederr")||"-1");
+    if(sort==="divergence") return parseFloat(c.getAttribute("data-divergence")||"0");
+    return parseFloat(c.getAttribute("data-turn")||"0");
+  }
+  function apply(){
+    var vis=[];
+    cards.forEach(function(c){ var p=pass(c); c.style.display=p?"":"none"; if(p) vis.push(c); });
+    vis.sort(function(a,b){ return key(b)-key(a); });
+    vis.forEach(function(c){ list.appendChild(c); });
+    var n=document.getElementById("rv-count"); if(n) n.textContent=String(vis.length);
+  }
+  document.querySelectorAll("[data-rv-group]").forEach(function(group){
+    var g=group.getAttribute("data-rv-group");
+    group.querySelectorAll("[data-rv-val]").forEach(function(chip){
+      chip.addEventListener("click",function(){
+        group.querySelectorAll("[data-rv-val]").forEach(function(x){ x.classList.remove("active"); });
+        chip.classList.add("active");
+        var v=chip.getAttribute("data-rv-val");
+        if(g==="turn") state.turn=parseFloat(v)||0; else state[g]=v;
+        apply();
+      });
+    });
+  });
+  var s=document.getElementById("rv-search");
+  if(s) s.addEventListener("input",function(){ state.q=s.value.trim().toLowerCase(); apply(); });
+  var so=document.getElementById("rv-sort");
+  if(so) so.addEventListener("change",function(){ sort=so.value; apply(); });
+  apply();
+})();
+(function(){
+  // 走势图开关:事件委托,适配折叠后才渲染可见的卡片;按结果切 chart-cell,按平台切 <g data-source>。
+  document.addEventListener("click",function(e){
+    var btn=e.target && e.target.closest ? e.target.closest(".rv-trend [data-v]") : null;
+    if(!btn) return;
+    var group=btn.closest("[data-rv-trend]");
+    var block=btn.closest(".rv-trend");
+    if(!group || !block) return;
+    group.querySelectorAll("[data-v]").forEach(function(x){ x.classList.remove("active"); });
+    btn.classList.add("active");
+    var kind=group.getAttribute("data-rv-trend"), v=btn.getAttribute("data-v");
+    if(kind==="outcome"){
+      block.querySelectorAll(".chart-cell[data-outcome]").forEach(function(cell){ cell.hidden = cell.getAttribute("data-outcome")!==v; });
+    } else {
+      block.querySelectorAll("svg [data-source]").forEach(function(g){ g.style.display = (v==="all" || g.getAttribute("data-source")===v) ? "" : "none"; });
+    }
+  });
+})();
+</script>`;
+}
+
 export function reviewPage(locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
-  const rows = getCompletedOdds(24);
+  const matches = getReviewBoard(24);
   const resultNote = API_FOOTBALL_KEY
     ? locale === "zh"
       ? "已启用赛果事件源；匹配到的比赛会显示比分、进球时间轴，并把进球标到赔率走势图上。"
@@ -1601,8 +2067,10 @@ export function reviewPage(locale: Locale = "zh"): string {
       ? "未配置 API_FOOTBALL_KEY 时，这里会清楚降级为赔率复盘；若 The Odds API scores 可用，则只补比分、不显示进球事件。"
       : "Without API_FOOTBALL_KEY this clearly degrades to odds review. The Odds API scores fallback can add score only, not events.";
   const body =
-    `<section class="panel" style="margin-top:16px"><div class="hero-title">${locale === "zh" ? "赛后赔率复盘" : "Post-match Odds Review"}</div><p class="hero-sub">${locale === "zh" ? "按开赛前 24 小时到开赛后 2.5 小时固定窗口复盘 PM、Kalshi、体彩和书商概率变化；优先用比分和进球时间解释市场转折。" : "Review PM, Kalshi, Sporttery, and book probability movement from 24h before kickoff to 2.5h after kickoff, with score and goal timing when available."}</p><div class="muted-line">${esc(resultNote)}</div></section>` +
-    `<section style="margin-top:14px;display:grid;gap:14px">${rows.length ? rows.map((row) => reviewMatchPanel(locale, row)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "还没有 inferred completed matches。" : "No inferred completed matches yet."}</p></div>`}</section>` +
+    `<section class="panel" style="margin-top:16px"><div class="hero-title">${locale === "zh" ? "赛后复盘" : "Post-match Review"}</div><p class="hero-sub">${locale === "zh" ? "默认只看复盘列表;点开任意一场展开三段式解读、关键转折、平台反应速度与多源概率。窗口为开赛前 24h 到开赛后 2.5h。" : "A review list by default; expand any match for the three-part read, key turns, platform reaction speed, and multi-source probabilities. Window is 24h before to 2.5h after kickoff."}</p><div class="muted-line">${esc(resultNote)}</div></section>` +
+    reviewControls(locale, matches.length) +
+    `<section id="review-list" style="margin-top:14px;display:grid;gap:12px">${matches.length ? matches.map((m) => reviewCard(locale, m)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "还没有可复盘的已结束比赛。" : "No completed matches to review yet."}</p></div>`}</section>` +
+    reviewFilterSortScript() +
     `<footer>${esc(COPY[locale].footer)}</footer>`;
   return page(locale, "review", `${locale === "zh" ? "赛后复盘" : "Post-match Review"} · WC Radar`, body, model, 300, "/review");
 }

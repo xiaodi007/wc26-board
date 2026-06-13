@@ -4,7 +4,7 @@
 
 当前 demo VPS 部署细节见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
-当前状态:Phase F 完成 — board 已新增 AI 投注计划模拟(首页/单场页、真实可赔赔率、AI 估算概率、25% Kelly、收益/亏损/EV 计算、临时 API key 不保存)和 `/walrus` 数据页;AI Betting Plan 已改为摘要卡片 + 弹窗,prompt 默认英文并随 `?lang=zh` 切中文;premium market intelligence UI、Walrus sanitized public snapshot、fixture 归并、health split 检查、移动端溢出修复和 board 端口回退均已完成。
+当前状态:Phase G 完成 — 在 Phase F(AI 投注计划模拟:首页/单场页、真实可赔赔率、AI 估算概率、25% Kelly、收益/亏损/EV 计算、临时 API key 不保存、`/walrus` 数据页、摘要卡片 + 弹窗、prompt 默认英文并随 `?lang=zh` 切中文、premium market intelligence UI、Walrus sanitized public snapshot、fixture 归并、health split 检查、移动端溢出修复、board 端口回退)基础上,新增 `/review` 赛后赔率复盘页与完赛比分/进球事件采集(`match_result`/`match_event` 表、`/api/match-events`,赛果源支持 API-Football 进球事件或 The Odds API scores 比分兜底)。导航统一为单侧栏,英文页文案已无残留中文。
 Phase D 同步完成:Polymarket `participants` 不再显示为全市场人数,改为 `PM active traders 24h` 与 `Top holder depth`;`liquidity` 使用 Gamma market 字段,holder/trade 数据失败时降级且 sampled 可见。
 体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析可在 `.env` 通过 `AI_PROVIDER` 选择 `anthropic` / `deepseek` / `kimi` / `openai-compatible`(不配 key 则降级为 prompt 预览+复制);告警推送需配 `SERVERCHAN_KEY`(不配则只落库、页面可见)。
 
@@ -37,7 +37,7 @@ tail -F logs/daemon.log
 - 体彩竞彩:用官方计算器公开 JSON 接口手动低频抓 `HAD`/`HHAD`;如果被 WAF 拦截,退回本地 CSV/JSON 导入。
 - 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Kalshi / Pinnacle / 体彩 HAD / 书商中位三向归一概率。
 - 避坑指数: `npm run avoid:sporttery` 输出体彩 HAD 隐含概率高于国际书商共识的选项,用于识别相对不划算方向,不是投注建议。
-- 决策 board: `npm run board` 起本地只读页面(默认 127.0.0.1:4626;默认端口占用时自动尝试 4627-4636)——premium dark market radar,支持 `?lang=zh|en`;首页显示 AI 投注计划卡片、PM liquidity、24h active traders、top holder depth、机会榜、AI Brief、Walrus Proof;详情页显示本场投注计划卡片、match hero、多平台 odds、PM market metrics、price trend、team basics、risk panel。
+- 决策 board: `npm run board` 起本地只读页面(默认 127.0.0.1:4626;默认端口占用时自动尝试 4627-4636)——premium dark market radar,支持 `?lang=zh|en`,导航统一走左侧栏;首页显示 AI 投注计划卡片、PM liquidity、24h active traders、top holder depth、机会榜、AI Brief、Walrus Proof;详情页显示本场投注计划卡片、match hero、多平台 odds、PM market metrics、price trend、team basics、risk panel;`/review` 赛后复盘页按开赛前 24h~开赛后 2.5h 固定窗口回放各源概率,并用比分/进球时间解释市场转折(无 `API_FOOTBALL_KEY` 时降级为纯赔率复盘)。
 - Polymarket market intelligence:Gamma `liquidityNum/liquidityClob`、`volume24hr/volumeNum`、`spread`、`lastTradePrice`、`conditionId` 落库;Data API `/holders` 只作为 top-holder depth/concentration,`/trades` 只作为 24h active traders/trade count,永不包装成 total participants。
 - AI 投注计划:首页 `/` 和单场 `/match` 显示摘要卡片,点击弹窗后可输入临时 bankroll/max daily loss/provider/base/model/key,直接生成投注模拟;AI 只输出估算概率、理由、风险和撤销条件,系统本地按 25% Kelly、单注 1% 本金上限、最大日亏损上限计算 stake、潜在净收益、最大亏损和 EV。临时 API key、本金和下注金额不写 `.env`、DB、日志或 Walrus。复制/调用 board betting prompt 时默认英文,`?lang=zh` 时切中文。
 - Walrus public data feed:`npm run export:walrus` 导出 aggregate-only JSON(`radar-latest.json`,`opportunities-latest.json`,`ai-board-latest.json`,`matches/*.json`,`manifest-latest.json`);`npm run publish:walrus:testnet` 可通过 publisher 上传并把最新 manifest blob 写入 `meta` 供 UI 显示;`/walrus` 展示最新 manifest/artifacts/blob/log,提供可打开的 blob/API 链接和本地 JSON 数据预览。
@@ -126,6 +126,7 @@ OPENAI_COMPAT_MODEL=your-chat-model
 | Kalshi | 无需(公开行情) | 5min | 冠军盘 `KXMENWORLDCUP-26`(48 队二元)+ 单场 series `KXWCGAME`(每场两队+TIE 三个二元) |
 | The Odds API | key(免费 500/月) | 90min(免费层) | 书商 1X2,欧洲区;credit=市场数×地区数 |
 | 体彩竞彩 | 官方公开计算器接口/手工 CSV | 手动低频 | 胜平负 HAD + 让球胜平负 HHAD |
+| 赛果/事件 | API-Football key(可选) | 10min | 比分与进球事件;未配 key 时用 The Odds API scores 仅补比分 |
 
 ## 体彩接入
 
@@ -182,7 +183,8 @@ Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
 - ~~Phase C~~:已完成:HHAD 让球盘主页面板、Server酱告警(实测推送+去重通过)、LIVE 进行中场次(待 6/13 凌晨开赛实测观感)。
 - ~~Phase D/E~~:已完成:PM market intelligence、active traders/top-holder 口径修正、premium radar UI、中英文切换、Walrus sanitized feed、fixture split 修复、health 覆盖和 board 端口回退。
 - ~~Phase F~~:已完成:AI 投注计划模拟、真实可赔赔率读层、25% Kelly 收益/亏损/EV 计算、摘要卡片 + 弹窗交互、prompt 默认英文/中文切换、临时 key 不保存、Walrus compact feed 与 `/walrus` 数据预览页面。真实 AI provider smoke call 需要在运行环境补齐 provider key 后执行。
-- 后续候选:AI 批量分析当日场次(早报)、让球盘公平概率建模(由 1X2 推导,需进球模型)、完赛比分采集。
+- ~~Phase G 赛后复盘 + 完赛比分~~:已完成:`/review` 赛后赔率复盘页(开赛前 24h~开赛后 2.5h 固定窗口走势)、`match_result`/`match_event` 表与 `/api/match-events`、API-Football 进球事件源、The Odds API scores 比分兜底;未配 `API_FOOTBALL_KEY` 时清晰降级为纯赔率复盘。导航去重(单侧栏)、英文页残留中文清理、Walrus artifact 文件名解码显示。
+- 后续候选:AI 批量分析当日场次(早报)、让球盘公平概率建模(由 1X2 推导,需进球模型)。
 
 ## 交接检查清单
 

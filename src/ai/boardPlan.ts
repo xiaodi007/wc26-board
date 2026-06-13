@@ -5,7 +5,7 @@ import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthCh
 import { getMarketRadar, formatThreeWayShort, type MatchIntelligence } from "../queries/marketIntelligence.js";
 import { getOfferedOddsForFixtures, resolveOfferedOdd, type OfferedOdd } from "../queries/offeredOdds.js";
 import { getProbabilityCandidates } from "../queries/probabilityModel.js";
-import { getSportteryEdges } from "../queries/sportteryAvoidance.js";
+import { getSportteryEdges, SPORTTERY_EDGE_PP, SPORTTERY_MIN_BOOKS } from "../queries/sportteryAvoidance.js";
 import { zhTeamName } from "../teams.js";
 import { callProvider, type AiProviderOverride } from "./analyze.js";
 
@@ -225,7 +225,7 @@ export function buildBoardBettingContext(fixtureKey?: string | null, locale: Boa
   const { rows, radar } = contextRows(fixtureKey);
   const offeredOdds = getOfferedOddsForFixtures(rows.map((row) => row.fixtureKey));
   const matchMap = new Map(radar.matches.map((match) => [match.row.fixtureKey, match]));
-  const edges = getSportteryEdges(rows, { thresholdPp: 2, minBooks: 5 });
+  const edges = getSportteryEdges(rows, { thresholdPp: SPORTTERY_EDGE_PP, minBooks: SPORTTERY_MIN_BOOKS });
   const probabilityCandidates = getProbabilityCandidates(70, fixtureKey)
     .candidates.filter((candidate) => rows.some((row) => row.fixtureKey === candidate.fixtureKey))
     .slice(0, 12);

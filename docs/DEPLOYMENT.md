@@ -26,33 +26,33 @@ quick tunnel is the current workaround.
 
 ## Latest Deployment
 
-- Latest app rebuild/restart: 2026-06-13 14:52 CST
-- Deployed change: AI Betting Plan modal loading/error UX, local
-  `localStorage` plan persistence, clearer "can buy / watch / avoid" betting
-  list, score/result tables (`match_result`, `match_event`), `/api/match-events`,
-  API-Football result/event source wiring, The Odds API scores fallback, and
-  score-led `/review` odds replay.
+- Latest app rebuild/restart: 2026-06-13 17:10 CST
+- Deployed change: post-match review list UX with filters/sorting, expandable
+  three-part match reads, key-turn and platform-reaction tables, switchable
+  review trend charts, unified sidebar navigation, Walrus manifest display
+  cleanup, shared Sporttery edge thresholds, and transparent model-edge fields
+  in market intelligence.
 - Public demo URL remains:
   `https://crossing-tide-extra-explicit.trycloudflare.com`.
-- Verification: `docker compose exec -T board npm run health` returned
+- Verification: `docker compose exec -T board npm exec tsc -- --noEmit` passed.
+  `docker compose exec -T board npm run health` returned
   `9 pass, 1 warn, 0 fail`. The only warn remained Sporttery freshness:
   the hourly job is deployed, but the VPS currently receives `HTTP 567` from
   the official Sporttery endpoint. PM, Kalshi, and Odds API were fresh, and the
   daemon will retry Sporttery hourly.
 - `docker compose exec -T board npm run status` showed 142 source rows,
-  72 fixtures, PM/Kalshi fresh at 2026-06-13 06:51 UTC, and next-24h matches
-  available. Sporttery remained on the prior remote snapshot
-  `2026-06-12T13:59:28.924Z`.
+  72 fixtures, PM fresh at 2026-06-13 09:10 UTC, Kalshi fresh at
+  2026-06-13 09:06 UTC, and next-24h matches available. Sporttery remained on
+  the prior remote snapshot `2026-06-12T13:59:28.924Z`.
 - Remote `.env` does not currently have `API_FOOTBALL_KEY`; `/review` therefore
   shows the clear odds-only degradation. The daemon used The Odds API scores
   fallback and upserted 4 `match_result` rows, but no goal-event timeline.
 - Internal API smoke passed: `/api/ai/providers` returned provider default
   metadata; `/api/probability` returned candidates; `/api/match-events` returned
-  configured status; `/api/analyze-board` with `1000` bankroll and `30` max loss
-  correctly returned `no_api_key`.
+  configured status.
 - Public quick-tunnel checks after deploy returned HTTP 200 for `/`,
-  `/?lang=en`, `/review?lang=zh`, `/match?...&lang=zh`, and
-  `/api/match-events?...`.
+  `/?lang=en`, `/review?lang=zh`, `/walrus?lang=zh`, `/match?...&lang=zh`,
+  `/api/ai/providers`, `/api/probability?limit=1`, and `/api/match-events?...`.
 
 The previous Walrus testnet compact publish from 2026-06-13 13:34 CST remains
 the latest recorded Walrus publish unless a new publish is run manually.

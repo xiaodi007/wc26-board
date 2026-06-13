@@ -1,5 +1,5 @@
 import { db } from "../db.js";
-import { getCurrentOdds, LABELS, normalizeThreeWay, type CurrentOddsRow, type Label, type ThreeWay } from "./currentOdds.js";
+import { getCurrentOdds, LABELS, medianThreeWay, normalizeThreeWay, type CurrentOddsRow, type Label, type ThreeWay } from "./currentOdds.js";
 
 export type RiskLevel = "low" | "watch" | "elevated" | "insufficient";
 export type SuggestedAction = "watch" | "set_alert" | "be_cautious" | "not_recommended";
@@ -13,7 +13,10 @@ export type OpportunityTag =
   | "beginner_friendly"
   | "high_risk"
   | "data_missing"
-  | "sampled";
+  | "sampled"
+  | "model_edge";
+
+export type PlayType = "match_winner" | "outright" | "handicap";
 export type RiskSignalKey = "liquidity" | "holder_concentration" | "thin_trading" | "volatility";
 export type RiskNoteKey =
   | "liquidity_missing"
@@ -92,11 +95,14 @@ export interface MarketOpportunity {
   marketTitle: string;
   platform: "Polymarket";
   marketType: "match_winner";
+  playType: PlayType;
   outcome: Label;
   outcomeName: string;
   currentPrice: number | null;
   marketImpliedProbability: number | null;
   aiEstimatedProbability: number | null;
+  modelEstimatedProbability: number | null; // 透明加权模型公允概率(非 AI)
+  modelDeviationPp: number | null; // 模型 − 市场(pp),正=市场低估
   probabilityGap: number | null;
   maxCrossPlatformProbabilityGap: number;
   volume24h: number | null;
@@ -129,6 +135,7 @@ export interface MatchIntelligence {
   pmTopHolderDepth: number | null;
   pmMaxHolderConcentration: number | null;
   sampled: boolean;
+  modelProbs: ThreeWay | null;
   maxDivergencePp: number;
   volatilityPp: number;
   heatScore: number;
@@ -520,6 +527,27 @@ function buildExplanation(parts: {
   };
 }
 
+// 透明加权公允概率(对齐 probabilityModel 的权重):书商中位 0.5×min(books/5,1) + Pinnacle 0.2 + PM 0.2×置信 + Kalshi 0.1。
+// source-neutral(不排除任何源),给机会榜每个赛果一个"模型估计"。证据不足(总权重<0.25,或独立源<2 且书商<3)返回 null。
+function modelThreeWay(row: CurrentOddsRow, confidenceScore: number): ThreeWay | null {
+  const bookRows = Object.entries(row.sourceOdds)
+    .filter(([source]) => source !== "polymarket" && source !== "kalshi" && source !== "sporttery" && source !== "pinnacle")
+    .map(([, probs]) => probs);
+  const bookMedian = medianThreeWay(bookRows);
+  const conf = Math.max(0.25, Math.min(1, confidenceScore / 100));
+  const parts = [
+    { probs: bookMedian, weight: 0.5 * Math.min(bookRows.length / 5, 1) },
+    { probs: row.pinnacle, weight: 0.2 },
+    { probs: row.polymarket, weight: 0.2 * conf },
+    { probs: row.kalshi, weight: 0.1 },
+  ].filter((p): p is { probs: ThreeWay; weight: number } => p.probs !== null && p.weight > 0);
+  const totalWeight = parts.reduce((sum, p) => sum + p.weight, 0);
+  if (totalWeight < 0.25 || (parts.length < 2 && bookRows.length < 3)) return null;
+  const blend: ThreeWay = { home: 0, draw: 0, away: 0 };
+  for (const part of parts) for (const label of LABELS) blend[label] += part.probs[label] * (part.weight / totalWeight);
+  return normalizeThreeWay(blend);
+}
+
 function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMarketMetric | null>, volatility: number): MatchIntelligence {
   const metrics = LABELS.map((label) => pmMarkets[label]).filter((m): m is PolymarketMarketMetric => m !== null);
   const pmLiquidity = sum(metrics.map((m) => m.liquidity));
@@ -552,6 +580,7 @@ function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMark
   const confidenceScore = clamp(liquidityScore * 0.35 + participationScore * 0.25 + (100 - riskPenalty * 3) * 0.25 + (row.books >= 5 ? 100 : row.books * 18) * 0.15);
   const closeHours = (Date.parse(row.kickoffUtc) - Date.now()) / 3600_000;
   const missing = pmLiquidity === null || pmActiveTraders24h === null || pmTopHolderDepth === null;
+  const modelProbs = modelThreeWay(row, confidenceScore);
 
   return {
     row,
@@ -564,6 +593,7 @@ function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMark
     pmTopHolderDepth,
     pmMaxHolderConcentration,
     sampled,
+    modelProbs,
     maxDivergencePp: divergence,
     volatilityPp: volatility,
     heatScore,
@@ -621,6 +651,12 @@ function opportunityFor(match: MatchIntelligence, label: Label): MarketOpportuni
     missing,
     sampled,
   });
+  const modelEstimatedProbability = match.modelProbs?.[label] ?? null;
+  const modelDeviationPp =
+    modelEstimatedProbability !== null && marketImpliedProbability !== null
+      ? (modelEstimatedProbability - marketImpliedProbability) * 100
+      : null;
+  if (modelDeviationPp !== null && Math.abs(modelDeviationPp) >= 2) tags.push("model_edge");
 
   return {
     fixtureKey: row.fixtureKey,
@@ -632,11 +668,14 @@ function opportunityFor(match: MatchIntelligence, label: Label): MarketOpportuni
     marketTitle: "match_winner",
     platform: "Polymarket",
     marketType: "match_winner",
+    playType: "match_winner",
     outcome: label,
     outcomeName: labelName(label, row),
     currentPrice,
     marketImpliedProbability,
     aiEstimatedProbability: null,
+    modelEstimatedProbability,
+    modelDeviationPp,
     probabilityGap,
     maxCrossPlatformProbabilityGap: divergence,
     volume24h: metric?.volume24h ?? null,

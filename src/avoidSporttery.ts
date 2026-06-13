@@ -1,4 +1,4 @@
-import { getSportteryAvoidance } from "./queries/sportteryAvoidance.js";
+import { getSportteryAvoidance, SPORTTERY_EDGE_PP, SPORTTERY_MIN_BOOKS } from "./queries/sportteryAvoidance.js";
 
 function numericArg(name: string, fallback: number): number {
   const arg = process.argv.find((a) => a.startsWith(`--${name}=`));
@@ -12,13 +12,13 @@ function pct(n: number): string {
 }
 
 const limit = Math.max(1, Math.min(Math.trunc(numericArg("limit", 20)), 100));
-const threshold = numericArg("threshold", 2);
+const threshold = numericArg("threshold", SPORTTERY_EDGE_PP);
 
 const rows = getSportteryAvoidance({
   outputLimit: limit,
   scanLimit: 50,
   thresholdPp: threshold,
-  minBooks: 5,
+  minBooks: SPORTTERY_MIN_BOOKS,
 }).map((row) => ({
   kickoff_utc: row.kickoffUtc,
   match: row.match,

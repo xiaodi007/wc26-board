@@ -1,5 +1,9 @@
 import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label } from "./currentOdds.js";
 
+// 体彩 vs 国际共识的判定门槛,全仓库共用一处(实测单家书商会出现 ±37pp 离群,故用中位数 + >=5 家)。
+export const SPORTTERY_EDGE_PP = 2;
+export const SPORTTERY_MIN_BOOKS = 5;
+
 export interface SportteryAvoidanceRow {
   kickoffUtc: string;
   match: string;
@@ -22,8 +26,8 @@ export function getSportteryEdges(
   fixtures: CurrentOddsRow[],
   options: { thresholdPp?: number; minBooks?: number } = {}
 ): SportteryEdges {
-  const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : 2;
-  const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : 5;
+  const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : SPORTTERY_EDGE_PP;
+  const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : SPORTTERY_MIN_BOOKS;
 
   const avoid: SportteryAvoidanceRow[] = [];
   const value: SportteryAvoidanceRow[] = [];
@@ -73,8 +77,8 @@ export function getSportteryAvoidance(options: SportteryAvoidanceOptions = {}): 
   const scanLimit = Number.isInteger(options.scanLimit) && Number(options.scanLimit) > 0
     ? Math.min(Number(options.scanLimit), 50)
     : 50;
-  const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : 2;
-  const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : 5;
+  const thresholdPp = Number.isFinite(options.thresholdPp) ? Number(options.thresholdPp) : SPORTTERY_EDGE_PP;
+  const minBooks = Number.isInteger(options.minBooks) && Number(options.minBooks) > 0 ? Number(options.minBooks) : SPORTTERY_MIN_BOOKS;
 
   return getSportteryEdges(getCurrentOdds(scanLimit), { thresholdPp, minBooks }).avoid.slice(0, outputLimit);
 }

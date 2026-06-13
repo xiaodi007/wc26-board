@@ -2,10 +2,8 @@
 // HTML 服务端渲染 + /api/* JSON(读层纯函数复用,与 CLI 同源)。
 // 唯一的"写"入口是 AI 分析(结果落 ai_analysis 表)与 prompt 模板(meta 表)。
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { BOARD_PORT, BOARD_PORT_EXPLICIT, log, WALRUS_FEED_DIR } from "./config.js";
-import { boardPage, matchPage, opportunitiesPage, reviewPage, walrusPage } from "./board/render.js";
+import { BOARD_PORT, BOARD_PORT_EXPLICIT, log } from "./config.js";
+import { boardPage, matchPage, opportunitiesPage, readWalrusManifest, reviewPage, walrusPage } from "./board/render.js";
 import { parseLocale } from "./board/i18n.js";
 import { getCurrentOdds } from "./queries/currentOdds.js";
 import { getSportteryEdges } from "./queries/sportteryAvoidance.js";
@@ -79,16 +77,6 @@ function boardPromptLocale(url: URL): BoardPromptLocale {
   return url.searchParams.get("lang") === "zh" ? "zh" : "en";
 }
 
-function walrusManifest(): unknown {
-  const path = join(WALRUS_FEED_DIR, "manifest-latest.json");
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as unknown;
-  } catch {
-    return null;
-  }
-}
-
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const locale = parseLocale(url.searchParams.get("lang"));
@@ -131,7 +119,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
           artifactCount: getMeta("walrus_latest_artifact_count"),
           totalBytes: getMeta("walrus_latest_total_bytes"),
         },
-        manifest: walrusManifest(),
+        manifest: readWalrusManifest(),
         logs: listWalrusPublishLog(20),
       });
     case "/api/ai/providers":

@@ -100,13 +100,12 @@ export function lineChart(series: ChartSeries[], options: ChartOptions): string 
   const paths = drawn
     .map((s) => {
       const pts = [...s.points].sort((a, b) => a.t - b.t);
-      if (s.markersOnly || pts.length === 1) {
-        return pts
-          .map((p) => `<circle cx="${x(p.t).toFixed(1)}" cy="${y(p.v).toFixed(1)}" r="3" fill="${s.color}"/>`)
-          .join("");
-      }
-      const d = pts.map((p, i) => `${i === 0 ? "M" : "L"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
-      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.6"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`;
+      // 每条 series 包一层 <g data-source>,前端可按平台切换显隐(复盘走势图)。
+      const inner =
+        s.markersOnly || pts.length === 1
+          ? pts.map((p) => `<circle cx="${x(p.t).toFixed(1)}" cy="${y(p.v).toFixed(1)}" r="3" fill="${s.color}"/>`).join("")
+          : `<path d="${pts.map((p, i) => `${i === 0 ? "M" : "L"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ")}" fill="none" stroke="${s.color}" stroke-width="1.6"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`;
+      return `<g data-source="${svgEsc(s.name)}">${inner}</g>`;
     })
     .join("");
 
