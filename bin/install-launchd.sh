@@ -44,9 +44,9 @@ cat > "$PLIST_PATH" <<EOF
 
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>-lc</string>
-    <string>cd ${ROOT} && exec ${NODE_BIN}/node node_modules/.bin/tsx src/daemon.ts</string>
+    <string>${NODE_BIN}/node</string>
+    <string>node_modules/.bin/tsx</string>
+    <string>src/daemon.ts</string>
   </array>
 
   <key>KeepAlive</key>
