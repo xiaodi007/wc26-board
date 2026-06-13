@@ -107,6 +107,8 @@ function ensureColumn(table: string, column: string, definition: string): void {
 ensureColumn("event", "fixture_key", "TEXT");
 ensureColumn("market", "condition_id", "TEXT");
 db.exec("CREATE INDEX IF NOT EXISTS idx_event_fixture_key ON event(fixture_key)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_market_event_source ON market(event_id, source)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_market_event_type ON market(event_id, market_type)");
 
 interface EventFixtureRow {
   id: string;

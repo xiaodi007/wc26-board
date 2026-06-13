@@ -717,7 +717,7 @@ function briefPanel(locale: Locale, model: ReturnType<typeof getMarketRadar>, ro
 export function boardPage(locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
   const t = COPY[locale];
-  const rows = getCurrentOdds(70);
+  const rows = model.matches.map((m) => m.row);
   const highLiquidity = model.opportunities.filter((o) => o.liquidity !== null).sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0)).slice(0, 6);
   const divergence = [...model.opportunities].sort((a, b) => b.maxCrossPlatformProbabilityGap - a.maxCrossPlatformProbabilityGap).slice(0, 4);
   const closingSoon = model.opportunities

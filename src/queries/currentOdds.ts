@@ -27,6 +27,7 @@ interface FixtureRow {
 }
 
 interface LatestRow {
+  fixture_key: string;
   source: string;
   outcome_label: string;
   prob_implied: number | null;
@@ -118,30 +119,53 @@ const fixturesStmt = db.prepare(
    LIMIT ?`
 );
 
-const latestStmt = db.prepare(
-  `WITH latest AS (
-     SELECT outcome_id, MAX(ts) AS ts
-     FROM snapshot
-     GROUP BY outcome_id
-   )
-   SELECT m.source, o.outcome_label, s.prob_implied
-   FROM market m
-   JOIN event e ON e.id=m.event_id
-   JOIN outcome o ON o.market_id=m.id
-   JOIN latest l ON l.outcome_id=o.id
-   JOIN snapshot s ON s.outcome_id=o.id AND s.ts=l.ts
-   WHERE e.fixture_key=?
-     AND o.outcome_label IN ('home', 'draw', 'away')
-     AND m.market_type IN ('1x2', 'home_win_binary', 'draw_binary', 'away_win_binary', 'sporttery_had')
-   ORDER BY m.source, o.outcome_label`
-);
+const latestStmtCache = new Map<number, ReturnType<typeof db.prepare>>();
+
+function latestStmtFor(count: number): ReturnType<typeof db.prepare> {
+  const cached = latestStmtCache.get(count);
+  if (cached) return cached;
+  const placeholders = Array.from({ length: count }, () => "?").join(",");
+  const stmt = db.prepare(
+    `WITH latest AS (
+       SELECT outcome_id, MAX(ts) AS ts
+       FROM snapshot
+       GROUP BY outcome_id
+     )
+     SELECT e.fixture_key, m.source, o.outcome_label, s.prob_implied
+     FROM event e
+     JOIN market m ON m.event_id=e.id
+     JOIN outcome o ON o.market_id=m.id
+     JOIN latest l ON l.outcome_id=o.id
+     JOIN snapshot s ON s.outcome_id=o.id AND s.ts=l.ts
+     WHERE e.fixture_key IN (${placeholders})
+       AND o.outcome_label IN ('home', 'draw', 'away')
+       AND m.market_type IN ('1x2', 'home_win_binary', 'draw_binary', 'away_win_binary', 'sporttery_had')
+     ORDER BY e.fixture_key, m.source, o.outcome_label`
+  );
+  latestStmtCache.set(count, stmt);
+  return stmt;
+}
+
+function getLatestRowsByFixture(fixtures: FixtureRow[]): Map<string, LatestRow[]> {
+  const keys = fixtures.map((fixture) => fixture.fixture_key);
+  if (!keys.length) return new Map();
+  const rows = (latestStmtFor(keys.length) as unknown as { all: (...params: string[]) => LatestRow[] }).all(...keys);
+  const byFixture = new Map<string, LatestRow[]>();
+  for (const row of rows) {
+    const group = byFixture.get(row.fixture_key) ?? [];
+    group.push(row);
+    byFixture.set(row.fixture_key, group);
+  }
+  return byFixture;
+}
 
 export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
   const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 8;
   const fixtures = fixturesStmt.all(safeLimit) as FixtureRow[];
+  const latestByFixture = getLatestRowsByFixture(fixtures);
 
   return fixtures.map((fixture) => {
-    const latest = latestStmt.all(fixture.fixture_key) as LatestRow[];
+    const latest = latestByFixture.get(fixture.fixture_key) ?? [];
     const bySource = new Map<string, Partial<ThreeWay>>();
     for (const row of latest) {
       if (!LABELS.includes(row.outcome_label as Label) || row.prob_implied === null) continue;

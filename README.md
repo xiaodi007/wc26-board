@@ -2,6 +2,8 @@
 
 2026 世界杯赔率聚合 dashboard(**个人研究/本地只读**:只读聚合 + 分析,不下单、不托管公开运行实例;公开仓库只包含源码,不包含 `.env`、SQLite、日志或导出数据)。
 
+当前 demo VPS 部署细节见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+
 当前状态:Phase E+ 完成 — board 已升级为 premium market intelligence UI(左侧导航、AI Brief、Polymarket liquidity/participation 风险面板、机会榜、详情页),支持 `?lang=zh|en` 中英文切换;新增 Walrus sanitized public snapshot 导出/发布命令;新增近似开球时间 fixture 归并、health split 检查、移动端溢出修复和 board 端口回退。
 Phase D 同步完成:Polymarket `participants` 不再显示为全市场人数,改为 `PM active traders 24h` 与 `Top holder depth`;`liquidity` 使用 Gamma market 字段,holder/trade 数据失败时降级且 sampled 可见。
 体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析可在 `.env` 通过 `AI_PROVIDER` 选择 `anthropic` / `deepseek` / `kimi` / `openai-compatible`(不配 key 则降级为 prompt 预览+复制);告警推送需配 `SERVERCHAN_KEY`(不配则只落库、页面可见)。

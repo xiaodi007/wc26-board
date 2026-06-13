@@ -1,6 +1,5 @@
 import { db } from "../db.js";
-import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "./currentOdds.js";
-import { getLineHistory } from "./lineHistory.js";
+import { getCurrentOdds, LABELS, normalizeThreeWay, type CurrentOddsRow, type Label, type ThreeWay } from "./currentOdds.js";
 
 export type RiskLevel = "low" | "watch" | "elevated" | "insufficient";
 export type SuggestedAction = "watch" | "set_alert" | "be_cautious" | "not_recommended";
@@ -183,6 +182,13 @@ interface RawMetricRow {
   source_updated_ts: string | null;
 }
 
+interface RawVolatilityRow {
+  fixture_key: string;
+  label: string;
+  bucket_epoch: number;
+  prob: number;
+}
+
 const pmMetricsStmt = db.prepare(
   `WITH latest_metric AS (
      SELECT market_id, MAX(ts) AS ts
@@ -337,17 +343,72 @@ function maxDivergence(row: CurrentOddsRow): number {
   return Math.max(...LABELS.map((label) => maxDivergenceForLabel(row, label)));
 }
 
-function volatilityPp(fixtureKey: string): number {
-  const history = getLineHistory(fixtureKey, { hours: 24, bucketMinutes: 30, sources: ["polymarket"], jumpPp: 2 });
+const volatilityStmtCache = new Map<number, ReturnType<typeof db.prepare>>();
+
+function volatilityStmtFor(count: number): ReturnType<typeof db.prepare> {
+  const cached = volatilityStmtCache.get(count);
+  if (cached) return cached;
+  const placeholders = Array.from({ length: count }, () => "?").join(",");
+  const stmt = db.prepare(
+    `SELECT e.fixture_key AS fixture_key,
+            o.outcome_label AS label,
+            (CAST(strftime('%s', s.ts) AS INTEGER) / ?) * ? AS bucket_epoch,
+            AVG(s.prob_implied) AS prob
+     FROM event e
+     JOIN market m ON m.event_id = e.id
+     JOIN outcome o ON o.market_id = m.id
+     JOIN snapshot s INDEXED BY idx_snapshot_outcome_ts ON s.outcome_id = o.id
+     WHERE e.fixture_key IN (${placeholders})
+       AND m.source = 'polymarket'
+       AND o.outcome_label IN ('home', 'draw', 'away')
+       AND m.market_type IN ('home_win_binary', 'draw_binary', 'away_win_binary')
+       AND s.prob_implied IS NOT NULL
+       AND s.ts >= datetime('now', ?)
+     GROUP BY e.fixture_key, o.outcome_label, bucket_epoch
+     ORDER BY e.fixture_key, bucket_epoch`
+  );
+  volatilityStmtCache.set(count, stmt);
+  return stmt;
+}
+
+function volatilityFromBuckets(buckets: Map<number, Partial<ThreeWay>>, jumpPp = 2): number {
+  const points = [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, partial]) => normalizeThreeWay(partial))
+    .filter((probs): probs is ThreeWay => probs !== null);
   let maxMove = 0;
-  for (const source of history) {
+  for (const label of LABELS) {
+    const values = points.map((p) => p[label]);
+    if (values.length >= 2) maxMove = Math.max(maxMove, Math.abs(values[values.length - 1] - values[0]) * 100);
+  }
+  for (let i = 1; i < points.length; i++) {
     for (const label of LABELS) {
-      const values = source.points.map((p) => p.probs[label]);
-      if (values.length >= 2) maxMove = Math.max(maxMove, Math.abs(values[values.length - 1] - values[0]) * 100);
+      const deltaPp = (points[i][label] - points[i - 1][label]) * 100;
+      if (Math.abs(deltaPp) >= jumpPp) maxMove = Math.max(maxMove, Math.abs(deltaPp));
     }
-    for (const jump of source.jumps) maxMove = Math.max(maxMove, Math.abs(jump.deltaPp));
   }
   return maxMove;
+}
+
+function getVolatilityMap(fixtureKeys: string[]): Map<string, number> {
+  if (!fixtureKeys.length) return new Map();
+  const bucketSec = 30 * 60;
+  const params: (number | string)[] = [bucketSec, bucketSec, ...fixtureKeys, "-24 hours"];
+  const rows = (
+    volatilityStmtFor(fixtureKeys.length) as unknown as { all: (...params: (number | string)[]) => RawVolatilityRow[] }
+  ).all(...params);
+  const byFixture = new Map<string, Map<number, Partial<ThreeWay>>>();
+  for (const row of rows) {
+    if (!LABELS.includes(row.label as Label)) continue;
+    const buckets = byFixture.get(row.fixture_key) ?? new Map<number, Partial<ThreeWay>>();
+    const probs = buckets.get(row.bucket_epoch) ?? {};
+    probs[row.label as Label] = row.prob;
+    buckets.set(row.bucket_epoch, probs);
+    byFixture.set(row.fixture_key, buckets);
+  }
+  const result = new Map<string, number>();
+  for (const [fixtureKey, buckets] of byFixture) result.set(fixtureKey, volatilityFromBuckets(buckets));
+  return result;
 }
 
 function liquidityRisk(liquidity: number | null, spread: number | null): RiskSignal {
@@ -459,7 +520,7 @@ function buildExplanation(parts: {
   };
 }
 
-function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMarketMetric | null>): MatchIntelligence {
+function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMarketMetric | null>, volatility: number): MatchIntelligence {
   const metrics = LABELS.map((label) => pmMarkets[label]).filter((m): m is PolymarketMarketMetric => m !== null);
   const pmLiquidity = sum(metrics.map((m) => m.liquidity));
   const pmVolume24h = sum(metrics.map((m) => m.volume24h));
@@ -470,7 +531,6 @@ function buildMatch(row: CurrentOddsRow, pmMarkets: Record<Label, PolymarketMark
   const pmMaxHolderConcentration = max(metrics.map((m) => m.holderConcentration));
   const sampled = metrics.some((m) => m.holdersSampled || m.tradesSampled);
   const divergence = maxDivergence(row);
-  const volatility = volatilityPp(row.fixtureKey);
   const liquidityScore = (scoreLog(pmLiquidity, 2_000_000) * 0.75 + spreadScore(pmAvgSpread) * 0.25);
   const participationScore = scoreLog(pmActiveTraders24h, 400) * 0.7 + scoreLog(pmTopHolderDepth, 120) * 0.3;
   const divergenceScore = clamp((divergence / 8) * 100);
@@ -650,7 +710,10 @@ function brief(matches: MatchIntelligence[], opportunities: MarketOpportunity[])
 export function getMarketRadar(limit = 70): MarketRadarModel {
   const current = getCurrentOdds(limit);
   const pmMetricMap = getPolymarketMetricMap();
-  const matches = current.map((row) => buildMatch(row, pmMetricMap.get(row.fixtureKey) ?? { home: null, draw: null, away: null }));
+  const volatilityMap = getVolatilityMap(current.map((row) => row.fixtureKey));
+  const matches = current.map((row) =>
+    buildMatch(row, pmMetricMap.get(row.fixtureKey) ?? { home: null, draw: null, away: null }, volatilityMap.get(row.fixtureKey) ?? 0)
+  );
   const opportunities = matches
     .flatMap((match) => LABELS.map((label) => opportunityFor(match, label)))
     .sort((a, b) => b.opportunityScore - a.opportunityScore);
