@@ -1,5 +1,6 @@
 import { KALSHI_POLL_MS, ODDS_API_KEY, ODDSAPI_POLL_MS, PM_POLL_MS } from "../config.js";
 import { db, getMeta } from "../db.js";
+import { fixtureTeamDayKey, isSameFixtureWindow } from "../fixtures.js";
 
 // Phase A 健康检查核心逻辑。CLI 壳在 src/health.ts,dashboard 直接复用本模块。
 
@@ -28,6 +29,57 @@ function ageMs(raw: string | null): number | null {
   if (!raw) return null;
   const t = Date.parse(raw);
   return Number.isNaN(t) ? null : Date.now() - t;
+}
+
+interface EventSourceRow {
+  id: string;
+  home_team: string;
+  away_team: string;
+  kickoff_utc: string;
+  fixture_key: string | null;
+  sources: string | null;
+}
+
+function findApproximateFixtureSplits(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.home_team, e.away_team, e.kickoff_utc, e.fixture_key, group_concat(DISTINCT m.source) AS sources
+       FROM event e
+       LEFT JOIN market m ON m.event_id=e.id
+       WHERE e.fixture_key IS NOT NULL AND e.fixture_key<>''
+       GROUP BY e.id`
+    )
+    .all() as EventSourceRow[];
+  const byTeamDay = new Map<string, EventSourceRow[]>();
+  for (const row of rows) {
+    const key = fixtureTeamDayKey(row.home_team, row.away_team, row.kickoff_utc);
+    byTeamDay.set(key, [...(byTeamDay.get(key) ?? []), row]);
+  }
+
+  const splits: string[] = [];
+  for (const group of byTeamDay.values()) {
+    const sorted = [...group].sort((a, b) => Date.parse(a.kickoff_utc) - Date.parse(b.kickoff_utc) || a.id.localeCompare(b.id));
+    let cluster: EventSourceRow[] = [];
+    const flush = (): void => {
+      if (cluster.length === 0) return;
+      const keys = [...new Set(cluster.map((row) => row.fixture_key).filter((key): key is string => Boolean(key)))];
+      if (keys.length > 1) {
+        const sample = cluster
+          .map((row) => `${row.home_team} vs ${row.away_team}@${row.kickoff_utc} [${row.sources ?? "event-only"}]`)
+          .join(" | ");
+        splits.push(`${sample} => ${keys.join(", ")}`);
+      }
+      cluster = [];
+    };
+
+    for (const row of sorted) {
+      const prev = cluster[cluster.length - 1];
+      if (prev && !isSameFixtureWindow(prev.kickoff_utc, row.kickoff_utc)) flush();
+      cluster.push(row);
+    }
+    flush();
+  }
+  return splits;
 }
 
 export function fmtAge(ms: number | null): string {
@@ -63,6 +115,13 @@ export function runHealthChecks(): HealthReport {
     add("fail", `event.fixture_key missing for ${eventCounts.missing_fixture_keys} rows`);
   } else {
     add("pass", `fixture keys present for ${eventCounts.events} source rows (${eventCounts.fixtures} fixtures)`);
+  }
+
+  const approximateSplits = findApproximateFixtureSplits();
+  if (approximateSplits.length > 0) {
+    add("fail", `approximate fixture splits detected: ${approximateSplits.slice(0, 3).join(" ; ")}`);
+  } else {
+    add("pass", "approximate fixture merge check clean (same teams within 45m share one fixture_key)");
   }
 
   const sportteryOrphans = one<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE id LIKE 'sporttery-%'`).n;

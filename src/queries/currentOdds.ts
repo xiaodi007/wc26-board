@@ -85,11 +85,36 @@ export function formatThreeWay(row: ThreeWay | null): string {
 const LIVE_WINDOW_H = 2.5;
 
 const fixturesStmt = db.prepare(
-  `SELECT fixture_key, MIN(home_team) AS home_team, MIN(away_team) AS away_team, MIN(kickoff_utc) AS kickoff_utc
-   FROM event
-   WHERE datetime(kickoff_utc) >= datetime('now', '-${LIVE_WINDOW_H} hours')
-   GROUP BY fixture_key
-   ORDER BY datetime(MIN(kickoff_utc))
+  `WITH candidates AS (
+     SELECT
+       e.fixture_key,
+       e.home_team,
+       e.away_team,
+       e.kickoff_utc,
+       ROW_NUMBER() OVER (
+         PARTITION BY e.fixture_key
+         ORDER BY
+           CASE
+             WHEN EXISTS (
+               SELECT 1 FROM market bm
+               WHERE bm.event_id=e.id
+                 AND bm.source NOT IN ('polymarket','kalshi','sporttery')
+             ) THEN 0
+             WHEN e.id NOT LIKE 'pm-%' AND e.id NOT LIKE 'sporttery-%' THEN 1
+             WHEN e.id LIKE 'pm-%' THEN 2
+             ELSE 3
+           END,
+           datetime(e.kickoff_utc),
+           e.id
+       ) AS rn,
+       MIN(datetime(e.kickoff_utc)) OVER (PARTITION BY e.fixture_key) AS first_kickoff
+     FROM event e
+     WHERE datetime(e.kickoff_utc) >= datetime('now', '-${LIVE_WINDOW_H} hours')
+   )
+   SELECT fixture_key, home_team, away_team, kickoff_utc
+   FROM candidates
+   WHERE rn=1
+   ORDER BY first_kickoff
    LIMIT ?`
 );
 

@@ -6,6 +6,7 @@ export interface SparkOptions {
   height?: number;
   stroke?: string;
   jumpIdx?: number[]; // 突变点(values 下标),画成小圆点
+  emptyLabel?: string;
 }
 
 export function sparkline(values: number[], options: SparkOptions = {}): string {
@@ -13,7 +14,7 @@ export function sparkline(values: number[], options: SparkOptions = {}): string 
   const height = options.height ?? 34;
   const stroke = options.stroke ?? "var(--blue)";
   if (values.length < 2) {
-    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><text x="4" y="${height / 2 + 4}" fill="var(--dim)" font-size="11">走势积累中</text></svg>`;
+    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><text x="4" y="${height / 2 + 4}" fill="var(--dim)" font-size="11">${options.emptyLabel ?? "Trend pending"}</text></svg>`;
   }
 
   const pad = 3;

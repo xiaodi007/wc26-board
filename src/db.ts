@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { DB_PATH } from "./config.js";
-import { fixtureKey } from "./fixtures.js";
+import { fixtureKey, fixtureTeamDayKey, isSameFixtureWindow } from "./fixtures.js";
 
 // schema 来源: deepseek-pro 设计稿(sui-research/sources/raw/wc26-deepseek-2026-06-12.md §1.4)
 // snapshot 只追加;market/outcome 是维表;event_id 可空(冠军盘等赛事级市场不挂单场)
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS market (
   spec TEXT,
   source TEXT NOT NULL,
   source_market_id TEXT,
+  condition_id TEXT,
   UNIQUE(source, source_market_id)
 );
 CREATE TABLE IF NOT EXISTS outcome (
@@ -42,6 +43,32 @@ CREATE TABLE IF NOT EXISTS snapshot (
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_outcome_ts ON snapshot(outcome_id, ts);
 CREATE INDEX IF NOT EXISTS idx_snapshot_ts ON snapshot(ts);
+CREATE TABLE IF NOT EXISTS market_metric_snapshot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_id INTEGER NOT NULL REFERENCES market(id),
+  ts TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_market_id TEXT,
+  condition_id TEXT,
+  liquidity REAL,
+  liquidity_clob REAL,
+  volume_24h REAL,
+  volume_total REAL,
+  spread REAL,
+  best_bid REAL,
+  best_ask REAL,
+  last_trade_price REAL,
+  holder_depth_top INTEGER,
+  holder_concentration REAL,
+  active_traders_24h INTEGER,
+  trade_count_24h INTEGER,
+  holders_sampled INTEGER DEFAULT 0,
+  trades_sampled INTEGER DEFAULT 0,
+  source_updated_ts TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_market_metric_market_ts ON market_metric_snapshot(market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_market_metric_condition_ts ON market_metric_snapshot(condition_id, ts);
+CREATE INDEX IF NOT EXISTS idx_market_metric_ts ON market_metric_snapshot(ts);
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -78,7 +105,17 @@ function ensureColumn(table: string, column: string, definition: string): void {
 }
 
 ensureColumn("event", "fixture_key", "TEXT");
+ensureColumn("market", "condition_id", "TEXT");
 db.exec("CREATE INDEX IF NOT EXISTS idx_event_fixture_key ON event(fixture_key)");
+
+interface EventFixtureRow {
+  id: string;
+  home_team: string;
+  away_team: string;
+  kickoff_utc: string;
+  fixture_key: string | null;
+  sources: string | null;
+}
 
 const stmtBackfillFixtureKey = db.prepare(`UPDATE event SET fixture_key=? WHERE id=?`);
 const eventsMissingFixtureKey = db
@@ -90,6 +127,83 @@ const backfillFixtureKeys = db.transaction(() => {
   }
 });
 backfillFixtureKeys();
+
+function sourceSet(row: Pick<EventFixtureRow, "sources">): Set<string> {
+  return new Set((row.sources ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+function hasBookSource(row: Pick<EventFixtureRow, "id" | "sources">): boolean {
+  return [...sourceSet(row)].some((source) => !["polymarket", "kalshi", "sporttery"].includes(source));
+}
+
+function canonicalPriority(row: Pick<EventFixtureRow, "id" | "sources">): number {
+  const sources = sourceSet(row);
+  if (hasBookSource(row)) return 0;
+  if (!row.id.startsWith("pm-") && !row.id.startsWith("sporttery-")) return 1;
+  if (row.id.startsWith("pm-") || sources.has("polymarket")) return 2;
+  if (sources.has("kalshi")) return 3;
+  if (row.id.startsWith("sporttery-") || sources.has("sporttery")) return 4;
+  return 5;
+}
+
+function rowTime(row: Pick<EventFixtureRow, "kickoff_utc">): number {
+  const t = Date.parse(row.kickoff_utc);
+  return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+}
+
+function chooseCanonicalRow(rows: EventFixtureRow[]): EventFixtureRow {
+  return [...rows].sort((a, b) => canonicalPriority(a) - canonicalPriority(b) || rowTime(a) - rowTime(b) || a.id.localeCompare(b.id))[0];
+}
+
+const stmtEventsWithSources = db.prepare(
+  `SELECT e.id, e.home_team, e.away_team, e.kickoff_utc, e.fixture_key, group_concat(DISTINCT m.source) AS sources
+   FROM event e
+   LEFT JOIN market m ON m.event_id=e.id
+   GROUP BY e.id`
+);
+const stmtUpdateFixtureKey = db.prepare(`UPDATE event SET fixture_key=? WHERE id=?`);
+const stmtUpdateAnalysisFixtureKey = db.prepare(`UPDATE ai_analysis SET fixture_key=? WHERE fixture_key=?`);
+
+function syncFixtureKey(row: EventFixtureRow, nextKey: string): void {
+  const prevKey = row.fixture_key;
+  if (prevKey !== nextKey) {
+    stmtUpdateFixtureKey.run(nextKey, row.id);
+    if (prevKey) stmtUpdateAnalysisFixtureKey.run(nextKey, prevKey);
+    row.fixture_key = nextKey;
+  }
+}
+
+function canonicalizeClusters(rows: EventFixtureRow[]): void {
+  const byTeamDay = new Map<string, EventFixtureRow[]>();
+  for (const row of rows) {
+    const groupKey = fixtureTeamDayKey(row.home_team, row.away_team, row.kickoff_utc);
+    byTeamDay.set(groupKey, [...(byTeamDay.get(groupKey) ?? []), row]);
+  }
+
+  for (const group of byTeamDay.values()) {
+    const sorted = [...group].sort((a, b) => rowTime(a) - rowTime(b) || a.id.localeCompare(b.id));
+    let cluster: EventFixtureRow[] = [];
+    const flush = (): void => {
+      if (cluster.length === 0) return;
+      const canonical = chooseCanonicalRow(cluster);
+      const nextKey = fixtureKey(canonical.home_team, canonical.away_team, canonical.kickoff_utc);
+      for (const row of cluster) syncFixtureKey(row, nextKey);
+      cluster = [];
+    };
+
+    for (const row of sorted) {
+      const prev = cluster[cluster.length - 1];
+      if (prev && !isSameFixtureWindow(prev.kickoff_utc, row.kickoff_utc)) flush();
+      cluster.push(row);
+    }
+    flush();
+  }
+}
+
+const backfillApproximateFixtureKeys = db.transaction(() => {
+  canonicalizeClusters(stmtEventsWithSources.all() as EventFixtureRow[]);
+});
+backfillApproximateFixtureKeys();
 
 const stmtUpsertEvent = db.prepare(
   `INSERT INTO event (id, home_team, away_team, kickoff_utc, fixture_key, status) VALUES (?, ?, ?, ?, ?, ?)
@@ -104,19 +218,48 @@ const stmtFindMarket = db.prepare(`SELECT id FROM market WHERE source=? AND sour
 const stmtInsertMarket = db.prepare(
   `INSERT INTO market (event_id, market_type, spec, source, source_market_id) VALUES (?, ?, ?, ?, ?)`
 );
+const stmtSetMarketConditionId = db.prepare(`UPDATE market SET condition_id=? WHERE id=? AND (condition_id IS NULL OR condition_id<>?)`);
 const stmtFindOutcome = db.prepare(`SELECT id FROM outcome WHERE market_id=? AND outcome_label=?`);
 const stmtInsertOutcome = db.prepare(`INSERT INTO outcome (market_id, outcome_label) VALUES (?, ?)`);
 const stmtInsertSnapshot = db.prepare(
   `INSERT INTO snapshot (outcome_id, ts, raw_price, prob_implied, bid, ask, volume, source_updated_ts)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 );
+const stmtInsertMarketMetric = db.prepare(
+  `INSERT INTO market_metric_snapshot (
+     market_id, ts, source, source_market_id, condition_id, liquidity, liquidity_clob,
+     volume_24h, volume_total, spread, best_bid, best_ask, last_trade_price,
+     holder_depth_top, holder_concentration, active_traders_24h, trade_count_24h,
+     holders_sampled, trades_sampled, source_updated_ts
+   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+);
 const stmtSetMeta = db.prepare(
   `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`
 );
 const stmtGetMeta = db.prepare(`SELECT value FROM meta WHERE key=?`);
 
+function canonicalFixtureKeyFor(id: string, home: string, away: string, kickoffUtc: string): string {
+  const current: EventFixtureRow = {
+    id,
+    home_team: home,
+    away_team: away,
+    kickoff_utc: kickoffUtc,
+    fixture_key: fixtureKey(home, away, kickoffUtc),
+    sources: null,
+  };
+  const rows = (stmtEventsWithSources.all() as EventFixtureRow[]).filter(
+    (row) =>
+      fixtureTeamDayKey(row.home_team, row.away_team, row.kickoff_utc) === fixtureTeamDayKey(home, away, kickoffUtc) &&
+      isSameFixtureWindow(row.kickoff_utc, kickoffUtc)
+  );
+  const canonical = chooseCanonicalRow([...rows.filter((row) => row.id !== id), current]);
+  return fixtureKey(canonical.home_team, canonical.away_team, canonical.kickoff_utc);
+}
+
 export function upsertEvent(id: string, home: string, away: string, kickoffUtc: string, status = "scheduled"): void {
-  stmtUpsertEvent.run(id, home, away, kickoffUtc, fixtureKey(home, away, kickoffUtc), status);
+  const nextKey = canonicalFixtureKeyFor(id, home, away, kickoffUtc);
+  stmtUpsertEvent.run(id, home, away, kickoffUtc, nextKey, status);
+  canonicalizeClusters((stmtEventsWithSources.all() as EventFixtureRow[]).filter((row) => row.fixture_key === nextKey || isSameFixtureWindow(row.kickoff_utc, kickoffUtc)));
 }
 
 const marketCache = new Map<string, number>();
@@ -134,6 +277,11 @@ export function getOrCreateMarket(
   const id = row ? row.id : Number(stmtInsertMarket.run(eventId, marketType, spec, source, sourceMarketId).lastInsertRowid);
   marketCache.set(key, id);
   return id;
+}
+
+export function setMarketConditionId(marketId: number, conditionId: string | null | undefined): void {
+  if (!conditionId) return;
+  stmtSetMarketConditionId.run(conditionId, marketId, conditionId);
 }
 
 const outcomeCache = new Map<string, number>();
@@ -163,6 +311,57 @@ export const insertSnapshots = db.transaction((rows: SnapshotRow[]) => {
     stmtInsertSnapshot.run(
       r.outcomeId, ts, r.rawPrice, r.probImplied,
       r.bid ?? null, r.ask ?? null, r.volume ?? null, r.sourceUpdatedTs ?? null
+    );
+  }
+  return rows.length;
+});
+
+export interface MarketMetricSnapshotRow {
+  marketId: number;
+  source: string;
+  sourceMarketId?: string | null;
+  conditionId?: string | null;
+  liquidity?: number | null;
+  liquidityClob?: number | null;
+  volume24h?: number | null;
+  volumeTotal?: number | null;
+  spread?: number | null;
+  bestBid?: number | null;
+  bestAsk?: number | null;
+  lastTradePrice?: number | null;
+  holderDepthTop?: number | null;
+  holderConcentration?: number | null;
+  activeTraders24h?: number | null;
+  tradeCount24h?: number | null;
+  holdersSampled?: boolean;
+  tradesSampled?: boolean;
+  sourceUpdatedTs?: string | null;
+}
+
+export const insertMarketMetricSnapshots = db.transaction((rows: MarketMetricSnapshotRow[]) => {
+  const ts = new Date().toISOString();
+  for (const r of rows) {
+    stmtInsertMarketMetric.run(
+      r.marketId,
+      ts,
+      r.source,
+      r.sourceMarketId ?? null,
+      r.conditionId ?? null,
+      r.liquidity ?? null,
+      r.liquidityClob ?? null,
+      r.volume24h ?? null,
+      r.volumeTotal ?? null,
+      r.spread ?? null,
+      r.bestBid ?? null,
+      r.bestAsk ?? null,
+      r.lastTradePrice ?? null,
+      r.holderDepthTop ?? null,
+      r.holderConcentration ?? null,
+      r.activeTraders24h ?? null,
+      r.tradeCount24h ?? null,
+      r.holdersSampled ? 1 : 0,
+      r.tradesSampled ? 1 : 0,
+      r.sourceUpdatedTs ?? null
     );
   }
   return rows.length;

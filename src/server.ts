@@ -2,14 +2,16 @@
 // HTML 服务端渲染 + /api/* JSON(读层纯函数复用,与 CLI 同源)。
 // 唯一的"写"入口是 AI 分析(结果落 ai_analysis 表)与 prompt 模板(meta 表)。
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { BOARD_PORT, log } from "./config.js";
-import { boardPage, matchPage } from "./board/render.js";
+import { BOARD_PORT, BOARD_PORT_EXPLICIT, log } from "./config.js";
+import { boardPage, matchPage, opportunitiesPage } from "./board/render.js";
+import { parseLocale } from "./board/i18n.js";
 import { getCurrentOdds } from "./queries/currentOdds.js";
 import { getSportteryEdges } from "./queries/sportteryAvoidance.js";
 import { getOutrightBoard } from "./queries/outright.js";
 import { runHealthChecks } from "./queries/healthChecks.js";
 import { getLineHistory } from "./queries/lineHistory.js";
-import { analyzeMatch, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey } from "./ai/analyze.js";
+import { getMarketRadar } from "./queries/marketIntelligence.js";
+import { analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey } from "./ai/analyze.js";
 import { listAnalyses, setMeta, db } from "./db.js";
 
 function html(res: ServerResponse, body: string): void {
@@ -46,15 +48,20 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  const locale = parseLocale(url.searchParams.get("lang"));
 
   switch (url.pathname) {
     case "/":
-      return html(res, boardPage());
+      return html(res, boardPage(locale));
+    case "/opportunities":
+      return html(res, opportunitiesPage(locale));
     case "/match": {
       const fk = url.searchParams.get("fk");
       if (!fk) return notFound(res);
-      return html(res, matchPage(fk));
+      return html(res, matchPage(fk, locale));
     }
+    case "/api/radar":
+      return json(res, getMarketRadar(intParam(url, "limit", 50, 70)));
     case "/api/current":
       return json(res, getCurrentOdds(intParam(url, "limit", 12, 50)));
     case "/api/avoid":
@@ -78,7 +85,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (req.method !== "POST") return notFound(res);
       const fk = url.searchParams.get("fk");
       if (!fk) return json(res, { error: "missing fk" }, 400);
-      if (!hasApiKey()) return json(res, { error: "no_api_key", message: "ANTHROPIC_API_KEY 未配置,请用复制 prompt 的方式" }, 503);
+      if (!hasApiKey()) {
+        const provider = currentAiProvider();
+        const missing = provider.missingConfig ?? provider.requiredKeyName;
+        const message =
+          locale === "zh"
+            ? `${missing} 未配置,请用复制 prompt 的方式`
+            : `${missing} is not configured. Copy the prompt instead.`;
+        return json(res, { error: "no_api_key", message }, 503);
+      }
       const outcome = await analyzeMatch(fk);
       return json(res, { id: outcome.id, model: outcome.model, verdict: outcome.verdict, raw: outcome.raw });
     }
@@ -106,14 +121,33 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 }
 
-const server = createServer((req, res) => {
-  void handle(req, res).catch((e) => {
-    log(`board: 500 ${req.url}: ${String(e)}`);
-    if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ error: String(e instanceof Error ? e.message : e) }));
+function createBoardServer() {
+  return createServer((req, res) => {
+    void handle(req, res).catch((e) => {
+      log(`board: 500 ${req.url}: ${String(e)}`);
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: String(e instanceof Error ? e.message : e) }));
+    });
   });
-});
+}
 
-server.listen(BOARD_PORT, "127.0.0.1", () => {
-  log(`board: http://127.0.0.1:${BOARD_PORT}`);
-});
+function listen(port: number): void {
+  const server = createBoardServer();
+  server.once("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EADDRINUSE" && !BOARD_PORT_EXPLICIT && port < 4636) {
+      const nextPort = port + 1;
+      log(`board: 127.0.0.1:${port} is in use, trying ${nextPort}`);
+      server.close();
+      listen(nextPort);
+      return;
+    }
+    const hint = BOARD_PORT_EXPLICIT ? "set BOARD_PORT to a free local port" : "free the port or set BOARD_PORT";
+    log(`board: failed to listen on 127.0.0.1:${port}: ${error.code ?? error.message}; ${hint}`);
+    process.exitCode = 1;
+  });
+  server.listen(port, "127.0.0.1", () => {
+    log(`board: http://127.0.0.1:${port}`);
+  });
+}
+
+listen(BOARD_PORT);
