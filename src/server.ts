@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { BOARD_PORT, BOARD_PORT_EXPLICIT, log, WALRUS_FEED_DIR } from "./config.js";
-import { boardPage, matchPage, opportunitiesPage, walrusPage } from "./board/render.js";
+import { boardPage, matchPage, opportunitiesPage, reviewPage, walrusPage } from "./board/render.js";
 import { parseLocale } from "./board/i18n.js";
 import { getCurrentOdds } from "./queries/currentOdds.js";
 import { getSportteryEdges } from "./queries/sportteryAvoidance.js";
@@ -13,7 +13,9 @@ import { getOutrightBoard } from "./queries/outright.js";
 import { runHealthChecks } from "./queries/healthChecks.js";
 import { getLineHistory } from "./queries/lineHistory.js";
 import { getMarketRadar } from "./queries/marketIntelligence.js";
-import { analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey, type AiProviderOverride } from "./ai/analyze.js";
+import { getProbabilityCandidates } from "./queries/probabilityModel.js";
+import { getMatchEventBundle } from "./queries/matchEvents.js";
+import { aiProviderOptions, analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey, type AiProviderOverride } from "./ai/analyze.js";
 import { analyzeBoardBettingPlan, boardPlanSystemPrompt, buildBoardBettingContext, latestBoardVerdict, planConstants, type BoardPromptLocale } from "./ai/boardPlan.js";
 import { listAnalyses, listWalrusPublishLog, setMeta, db, getMeta } from "./db.js";
 import { getOfferedOddsForFixtures } from "./queries/offeredOdds.js";
@@ -63,6 +65,7 @@ function providerOverride(body: Record<string, unknown>): AiProviderOverride {
     model: str(body, "model"),
     thinking: str(body, "thinking"),
     temperature: str(body, "temperature"),
+    maxTokens: str(body, "maxTokens"),
   };
 }
 
@@ -95,6 +98,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return html(res, boardPage(locale));
     case "/opportunities":
       return html(res, opportunitiesPage(locale));
+    case "/review":
+      return html(res, reviewPage(locale));
     case "/walrus":
       return html(res, walrusPage(locale));
     case "/match": {
@@ -104,6 +109,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     case "/api/radar":
       return json(res, getMarketRadar(intParam(url, "limit", 50, 70)));
+    case "/api/probability":
+      return json(res, getProbabilityCandidates(intParam(url, "limit", 70, 70), url.searchParams.get("fk")));
     case "/api/current":
       return json(res, getCurrentOdds(intParam(url, "limit", 12, 50)));
     case "/api/avoid":
@@ -130,12 +137,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     case "/api/ai/providers":
       return json(res, {
         current: currentAiProvider(),
-        providers: [
-          { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com", modelHint: "claude-sonnet-4-6" },
-          { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", modelHint: "deepseek-v4-flash" },
-          { id: "kimi", label: "Kimi", baseUrl: "https://api.moonshot.cn/v1", modelHint: "kimi-k2.6" },
-          { id: "openai-compatible", label: "OpenAI-compatible", baseUrl: "", modelHint: "" },
-        ],
+        providers: aiProviderOptions(),
       });
     case "/api/history": {
       const fk = url.searchParams.get("fk");
@@ -145,8 +147,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         getLineHistory(fk, {
           hours: intParam(url, "hours", 24, 24 * 14),
           bucketMinutes: intParam(url, "bucket", 30, 24 * 60),
+          fromTs: url.searchParams.get("from") ?? undefined,
+          toTs: url.searchParams.get("to") ?? undefined,
         })
       );
+    }
+    case "/api/match-events": {
+      const fk = url.searchParams.get("fk");
+      if (!fk) return json(res, { error: "missing fk" }, 400);
+      return json(res, getMatchEventBundle(fk));
     }
     case "/api/analyze": {
       if (req.method !== "POST") return notFound(res);

@@ -119,6 +119,40 @@ const fixturesStmt = db.prepare(
    LIMIT ?`
 );
 
+const completedFixturesStmt = db.prepare(
+  `WITH candidates AS (
+     SELECT
+       e.fixture_key,
+       e.home_team,
+       e.away_team,
+       e.kickoff_utc,
+       ROW_NUMBER() OVER (
+         PARTITION BY e.fixture_key
+         ORDER BY
+           CASE
+             WHEN EXISTS (
+               SELECT 1 FROM market bm
+               WHERE bm.event_id=e.id
+                 AND bm.source NOT IN ('polymarket','kalshi','sporttery')
+             ) THEN 0
+             WHEN e.id NOT LIKE 'pm-%' AND e.id NOT LIKE 'sporttery-%' THEN 1
+             WHEN e.id LIKE 'pm-%' THEN 2
+             ELSE 3
+           END,
+           datetime(e.kickoff_utc),
+           e.id
+       ) AS rn,
+       MIN(datetime(e.kickoff_utc)) OVER (PARTITION BY e.fixture_key) AS first_kickoff
+     FROM event e
+     WHERE datetime(e.kickoff_utc) < datetime('now', '-${LIVE_WINDOW_H} hours')
+   )
+   SELECT fixture_key, home_team, away_team, kickoff_utc
+   FROM candidates
+   WHERE rn=1
+   ORDER BY first_kickoff DESC
+   LIMIT ?`
+);
+
 const latestStmtCache = new Map<number, ReturnType<typeof db.prepare>>();
 
 function latestStmtFor(count: number): ReturnType<typeof db.prepare> {
@@ -159,9 +193,7 @@ function getLatestRowsByFixture(fixtures: FixtureRow[]): Map<string, LatestRow[]
   return byFixture;
 }
 
-export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
-  const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 8;
-  const fixtures = fixturesStmt.all(safeLimit) as FixtureRow[];
+function assembleOddsRows(fixtures: FixtureRow[]): CurrentOddsRow[] {
   const latestByFixture = getLatestRowsByFixture(fixtures);
 
   return fixtures.map((fixture) => {
@@ -204,4 +236,14 @@ export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
       books: bookRows.length,
     };
   });
+}
+
+export function getCurrentOdds(limit = 8): CurrentOddsRow[] {
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 8;
+  return assembleOddsRows(fixturesStmt.all(safeLimit) as FixtureRow[]);
+}
+
+export function getCompletedOdds(limit = 20): CurrentOddsRow[] {
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+  return assembleOddsRows(completedFixturesStmt.all(safeLimit) as FixtureRow[]);
 }

@@ -1,6 +1,6 @@
 import { fetchJsonWithHeaders } from "../http.js";
 import { ODDS_API_KEY, ODDSAPI_BASE, ODDSAPI_SPORT, ODDSAPI_REGIONS, ODDSAPI_MARKETS, log } from "../config.js";
-import { upsertEvent, getOrCreateMarket, getOrCreateOutcome, insertSnapshots, setMeta, type SnapshotRow } from "../db.js";
+import { eventFixtureKey, upsertEvent, getOrCreateMarket, getOrCreateOutcome, insertSnapshots, setMeta, upsertMatchResult, type SnapshotRow } from "../db.js";
 import { decimalToProb } from "../normalize.js";
 
 interface OddsApiEvent {
@@ -24,12 +24,18 @@ interface OddsApiOddsEvent extends OddsApiEvent {
   }[];
 }
 
-function recordQuota(headers: Headers): void {
+interface OddsApiScoreEvent extends OddsApiEvent {
+  completed: boolean;
+  scores?: { name: string; score: string }[] | null;
+  last_update?: string | null;
+}
+
+function recordQuota(headers: Headers, lastCallKey: string | null = "oddsapi_last_call"): void {
   const remaining = headers.get("x-requests-remaining");
   const used = headers.get("x-requests-used");
   if (remaining !== null) setMeta("oddsapi_credits_remaining", remaining);
   if (used !== null) setMeta("oddsapi_credits_used", used);
-  setMeta("oddsapi_last_call", new Date().toISOString());
+  if (lastCallKey) setMeta(lastCallKey, new Date().toISOString());
 }
 
 // /events 端点不计费(0 credit),用于赛程 bootstrap
@@ -79,5 +85,54 @@ export async function pollOdds(): Promise<number> {
   }
   const n = insertSnapshots(rows);
   log(`oddsapi: ${data.length} events, ${n} snapshots (credits remaining: see meta)`);
+  return n;
+}
+
+function scoreForTeam(ev: OddsApiScoreEvent, team: string): number | null {
+  const raw = ev.scores?.find((row) => row.name === team)?.score;
+  const value = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function scoreWinner(home: number | null, away: number | null): "home" | "draw" | "away" | null {
+  if (home === null || away === null) return null;
+  if (home > away) return "home";
+  if (home < away) return "away";
+  return "draw";
+}
+
+// Scores fallback: The Odds API exposes live/recent completed scores, but no goal event timeline.
+export async function pollScores(): Promise<number> {
+  if (!ODDS_API_KEY) return 0;
+  const url = `${ODDSAPI_BASE}/sports/${ODDSAPI_SPORT}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3&dateFormat=iso`;
+  const { data, headers } = await fetchJsonWithHeaders<OddsApiScoreEvent[]>(url, "oddsapi/scores");
+  recordQuota(headers, null);
+
+  let n = 0;
+  const now = new Date().toISOString();
+  for (const ev of data) {
+    upsertEvent(ev.id, ev.home_team, ev.away_team, ev.commence_time, ev.completed ? "completed" : "scheduled");
+    const fixtureKey = eventFixtureKey(ev.id);
+    if (!fixtureKey) continue;
+    const homeScore = scoreForTeam(ev, ev.home_team);
+    const awayScore = scoreForTeam(ev, ev.away_team);
+    if (homeScore === null && awayScore === null && !ev.completed) continue;
+    upsertMatchResult({
+      fixtureKey,
+      source: "oddsapi",
+      sourceFixtureId: ev.id,
+      status: ev.completed ? "FT" : "LIVE",
+      elapsed: null,
+      homeScore,
+      awayScore,
+      winner: scoreWinner(homeScore, awayScore),
+      lastUpdateTs: ev.last_update ?? now,
+      rawJson: JSON.stringify(ev),
+    });
+    n += 1;
+  }
+  setMeta("oddsapi_scores_last_call", now);
+  setMeta("results_last_call", now);
+  log(`oddsapi scores: ${n}/${data.length} results upserted`);
   return n;
 }

@@ -45,6 +45,16 @@ export const KALSHI_OUTRIGHT_EVENT = "KXMENWORLDCUP-26"; // 2026 Men's World Cup
 export const KALSHI_GAME_SERIES = "KXWCGAME"; // 单场系列,每场 3 个二元市场(两队 + TIE)
 export const KALSHI_POLL_MS = Number(process.env.KALSHI_POLL_MS || 5 * 60 * 1000);
 
+// 中国体彩 SP,官方接口无需 key。默认每小时抓一次,HAD/HHAD 都落 snapshot。
+export const SPORTTERY_POLL_MS = Number(process.env.SPORTTERY_POLL_MS || 60 * 60 * 1000);
+
+// 赛果/事件源。API-Football 提供进球事件;未配置 key 时可用 The Odds API scores 只补比分。
+export const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || "";
+export const API_FOOTBALL_BASE = process.env.API_FOOTBALL_BASE || "https://v3.football.api-sports.io";
+export const API_FOOTBALL_LEAGUE = Number(process.env.API_FOOTBALL_LEAGUE || 1);
+export const API_FOOTBALL_SEASON = Number(process.env.API_FOOTBALL_SEASON || 2026);
+export const RESULTS_POLL_MS = Number(process.env.RESULTS_POLL_MS || 10 * 60 * 1000);
+
 // 本地只读 board,只绑 127.0.0.1。PORT 兜底兼容 IDE preview 注入的端口
 export const BOARD_PORT_EXPLICIT = Boolean(process.env.BOARD_PORT || process.env.PORT);
 export const BOARD_PORT = Number(process.env.BOARD_PORT || process.env.PORT || 4626);

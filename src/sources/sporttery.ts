@@ -1,7 +1,7 @@
 import { fetchJsonWithHeaders } from "../http.js";
-import { fixtureKey, normalizeKickoffUtc } from "../fixtures.js";
+import { fixtureKey } from "../fixtures.js";
 import { decimalToProb } from "../normalize.js";
-import { db, getOrCreateMarket, getOrCreateOutcome, insertSnapshots, setMeta, upsertEvent, type SnapshotRow } from "../db.js";
+import { db, getOrCreateMarket, getOrCreateOutcome, insertSnapshots, setMeta, type SnapshotRow } from "../db.js";
 import { log } from "../config.js";
 
 type SportteryPool = "had" | "hhad";
@@ -78,16 +78,13 @@ function decimal(value: string | undefined): number | null {
   return Number.isFinite(n) && n > 1 ? n : null;
 }
 
-function findEventId(match: SportteryMatch, kickoff: string): string {
+function findEventId(match: SportteryMatch, kickoff: string): string | null {
   const key = fixtureKey(match.homeTeamAllName, match.awayTeamAllName, kickoff);
   const existing = db
     .prepare(`SELECT id FROM event WHERE fixture_key=? ORDER BY CASE WHEN id LIKE 'pm-%' THEN 0 ELSE 1 END, id LIMIT 1`)
     .get(key) as { id: string } | undefined;
   if (existing) return existing.id;
-
-  const id = `sporttery-${match.matchId}`;
-  upsertEvent(id, match.homeTeamAllName, match.awayTeamAllName, normalizeKickoffUtc(kickoff));
-  return id;
+  return null;
 }
 
 function addPoolRows(rows: SnapshotRow[], match: SportteryMatch, eventId: string, pool: SportteryPool): number {
@@ -141,6 +138,7 @@ export async function pollSporttery(): Promise<number> {
 
   const rows: SnapshotRow[] = [];
   let matches = 0;
+  let skippedUnmatched = 0;
   let hadMarkets = 0;
   let hhadMarkets = 0;
   for (const group of data.value.matchInfoList) {
@@ -148,6 +146,10 @@ export async function pollSporttery(): Promise<number> {
       matches++;
       const kickoff = kickoffUtc(match);
       const eventId = findEventId(match, kickoff);
+      if (!eventId) {
+        skippedUnmatched++;
+        continue;
+      }
       if (addPoolRows(rows, match, eventId, "had")) hadMarkets++;
       if (addPoolRows(rows, match, eventId, "hhad")) hhadMarkets++;
     }
@@ -156,6 +158,6 @@ export async function pollSporttery(): Promise<number> {
   const n = insertSnapshots(rows);
   setMeta("sporttery_last_call", new Date().toISOString());
   if (data.value.lastUpdateTime) setMeta("sporttery_source_updated", data.value.lastUpdateTime);
-  log(`sporttery: ${matches} matches, had=${hadMarkets}, hhad=${hhadMarkets}, ${n} snapshots`);
+  log(`sporttery: ${matches} matches, had=${hadMarkets}, hhad=${hhadMarkets}, skipped_unmatched=${skippedUnmatched}, ${n} snapshots`);
   return n;
 }

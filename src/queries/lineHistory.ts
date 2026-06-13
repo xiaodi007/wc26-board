@@ -26,6 +26,8 @@ export interface LineHistoryOptions {
   bucketMinutes?: number; // 降采样粒度,默认 30
   jumpPp?: number; // 突变阈值(百分点),默认 2
   sources?: string[]; // 默认全部
+  fromTs?: string; // 固定窗口起点 ISO;优先于 hours
+  toTs?: string; // 固定窗口终点 ISO
 }
 
 const MATCH_TYPES = "('1x2','home_win_binary','draw_binary','away_win_binary','sporttery_had')";
@@ -38,11 +40,12 @@ const historyStmt = db.prepare(
    JOIN outcome o ON o.id = s.outcome_id
    JOIN market m ON m.id = o.market_id
    JOIN event e ON e.id = m.event_id
-   WHERE e.fixture_key = ?
-     AND o.outcome_label IN ('home', 'draw', 'away')
-     AND m.market_type IN ${MATCH_TYPES}
-     AND s.prob_implied IS NOT NULL
-     AND s.ts >= datetime('now', ?)
+     WHERE e.fixture_key = ?
+       AND o.outcome_label IN ('home', 'draw', 'away')
+       AND m.market_type IN ${MATCH_TYPES}
+       AND s.prob_implied IS NOT NULL
+       AND s.ts >= ?
+       AND s.ts <= ?
    GROUP BY m.source, o.outcome_label, bucket_epoch
    ORDER BY bucket_epoch`
 );
@@ -60,8 +63,10 @@ export function getLineHistory(fixtureKey: string, options: LineHistoryOptions =
     Number.isInteger(options.bucketMinutes) && Number(options.bucketMinutes) > 0 ? Math.min(Number(options.bucketMinutes), 24 * 60) : 30;
   const jumpPp = Number.isFinite(options.jumpPp) && Number(options.jumpPp) > 0 ? Number(options.jumpPp) : 2;
   const bucketSec = bucketMinutes * 60;
+  const fromTs = options.fromTs ?? new Date(Date.now() - hours * 3600_000).toISOString();
+  const toTs = options.toTs ?? new Date().toISOString();
 
-  const raw = historyStmt.all(bucketSec, bucketSec, fixtureKey, `-${hours} hours`) as RawRow[];
+  const raw = historyStmt.all(bucketSec, bucketSec, fixtureKey, fromTs, toTs) as RawRow[];
 
   // source → bucket_epoch → partial ThreeWay
   const bySource = new Map<string, Map<number, Partial<ThreeWay>>>();

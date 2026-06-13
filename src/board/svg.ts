@@ -58,6 +58,7 @@ export interface ChartOptions {
   height?: number;
   tMin: number;
   tMax: number;
+  markers?: { t: number; label: string; color?: string }[];
 }
 
 export function lineChart(series: ChartSeries[], options: ChartOptions): string {
@@ -83,6 +84,7 @@ export function lineChart(series: ChartSeries[], options: ChartOptions): string 
   const tSpan = Math.max(options.tMax - options.tMin, 1);
   const x = (t: number): number => padL + ((t - options.tMin) / tSpan) * (width - padL - padR);
   const y = (v: number): number => padT + (1 - (v - vMin) / (vMax - vMin)) * (height - padT - padB);
+  const svgEsc = (raw: string): string => raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
   // y 轴只标整 5% 网格,最多 4 条
   const gridLines: string[] = [];
@@ -108,6 +110,20 @@ export function lineChart(series: ChartSeries[], options: ChartOptions): string 
     })
     .join("");
 
+  const markers = (options.markers ?? [])
+    .filter((marker) => Number.isFinite(marker.t) && marker.t >= options.tMin && marker.t <= options.tMax)
+    .slice(0, 8)
+    .map((marker, index) => {
+      const mx = x(marker.t);
+      const color = marker.color ?? "var(--amber)";
+      const labelY = padT + 9 + (index % 2) * 13;
+      return (
+        `<line x1="${mx.toFixed(1)}" y1="${padT}" x2="${mx.toFixed(1)}" y2="${height - padB}" stroke="${color}" stroke-width="1" stroke-dasharray="3 3" opacity=".9"/>` +
+        `<text x="${Math.min(width - padR - 4, Math.max(padL + 4, mx + 3)).toFixed(1)}" y="${labelY}" fill="${color}" font-size="9">${svgEsc(marker.label)}</text>`
+      );
+    })
+    .join("");
+
   // x 轴两端时刻(北京时间 HH:mm)
   const fmt = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false });
   const xLabels =
@@ -117,6 +133,7 @@ export function lineChart(series: ChartSeries[], options: ChartOptions): string 
   return (
     `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
     gridLines.join("") +
+    markers +
     paths +
     xLabels +
     `</svg>`

@@ -110,6 +110,43 @@ CREATE TABLE IF NOT EXISTS walrus_publish_log (
   total_bytes INTEGER DEFAULT 0,
   detail TEXT
 );
+CREATE TABLE IF NOT EXISTS match_result (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fixture_key TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_fixture_id TEXT,
+  status TEXT,
+  elapsed INTEGER,
+  home_score INTEGER,
+  away_score INTEGER,
+  winner TEXT,
+  last_update_ts TEXT,
+  raw_json TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(fixture_key, source)
+);
+CREATE INDEX IF NOT EXISTS idx_match_result_fixture ON match_result(fixture_key, source);
+CREATE TABLE IF NOT EXISTS match_event (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fixture_key TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_fixture_id TEXT,
+  event_key TEXT NOT NULL,
+  minute INTEGER,
+  extra_minute INTEGER,
+  team_side TEXT,
+  team_name TEXT,
+  player_name TEXT,
+  assist_name TEXT,
+  event_type TEXT,
+  detail TEXT,
+  score_home INTEGER,
+  score_away INTEGER,
+  raw_json TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(fixture_key, source, event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_match_event_fixture ON match_event(fixture_key, minute, extra_minute, id);
 `;
 
 export const db = new Database(DB_PATH);
@@ -258,6 +295,56 @@ const stmtSetMeta = db.prepare(
   `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`
 );
 const stmtGetMeta = db.prepare(`SELECT value FROM meta WHERE key=?`);
+const stmtGetEventFixtureKey = db.prepare(`SELECT fixture_key FROM event WHERE id=?`);
+const stmtFindEventByFixture = db.prepare(
+  `SELECT id, home_team, away_team, kickoff_utc, fixture_key
+   FROM event
+   WHERE fixture_key=?
+   ORDER BY
+     CASE
+       WHEN id NOT LIKE 'pm-%' AND id NOT LIKE 'sporttery-%' THEN 0
+       WHEN id LIKE 'pm-%' THEN 1
+       ELSE 2
+     END,
+     datetime(kickoff_utc),
+     id
+   LIMIT 1`
+);
+const stmtUpsertMatchResult = db.prepare(
+  `INSERT INTO match_result (
+     fixture_key, source, source_fixture_id, status, elapsed,
+     home_score, away_score, winner, last_update_ts, raw_json
+   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(fixture_key, source) DO UPDATE SET
+     source_fixture_id=excluded.source_fixture_id,
+     status=excluded.status,
+     elapsed=excluded.elapsed,
+     home_score=excluded.home_score,
+     away_score=excluded.away_score,
+     winner=excluded.winner,
+     last_update_ts=excluded.last_update_ts,
+     raw_json=excluded.raw_json`
+);
+const stmtUpsertMatchEvent = db.prepare(
+  `INSERT INTO match_event (
+     fixture_key, source, source_fixture_id, event_key, minute, extra_minute,
+     team_side, team_name, player_name, assist_name, event_type, detail,
+     score_home, score_away, raw_json
+   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(fixture_key, source, event_key) DO UPDATE SET
+     source_fixture_id=excluded.source_fixture_id,
+     minute=excluded.minute,
+     extra_minute=excluded.extra_minute,
+     team_side=excluded.team_side,
+     team_name=excluded.team_name,
+     player_name=excluded.player_name,
+     assist_name=excluded.assist_name,
+     event_type=excluded.event_type,
+     detail=excluded.detail,
+     score_home=excluded.score_home,
+     score_away=excluded.score_away,
+     raw_json=excluded.raw_json`
+);
 
 function canonicalFixtureKeyFor(id: string, home: string, away: string, kickoffUtc: string): string {
   const current: EventFixtureRow = {
@@ -281,6 +368,23 @@ export function upsertEvent(id: string, home: string, away: string, kickoffUtc: 
   const nextKey = canonicalFixtureKeyFor(id, home, away, kickoffUtc);
   stmtUpsertEvent.run(id, home, away, kickoffUtc, nextKey, status);
   canonicalizeClusters((stmtEventsWithSources.all() as EventFixtureRow[]).filter((row) => row.fixture_key === nextKey || isSameFixtureWindow(row.kickoff_utc, kickoffUtc)));
+}
+
+export function eventFixtureKey(id: string): string | null {
+  const row = stmtGetEventFixtureKey.get(id) as { fixture_key: string | null } | undefined;
+  return row?.fixture_key ?? null;
+}
+
+export interface EventIdentityRow {
+  id: string;
+  home_team: string;
+  away_team: string;
+  kickoff_utc: string;
+  fixture_key: string;
+}
+
+export function findEventByFixtureKey(fixtureKey: string): EventIdentityRow | null {
+  return (stmtFindEventByFixture.get(fixtureKey) as EventIdentityRow | undefined) ?? null;
 }
 
 const marketCache = new Map<string, number>();
@@ -395,6 +499,75 @@ export function getMeta(key: string): string | null {
   const row = stmtGetMeta.get(key) as { value: string } | undefined;
   return row ? row.value : null;
 }
+
+export interface MatchResultInput {
+  fixtureKey: string;
+  source: string;
+  sourceFixtureId?: string | null;
+  status?: string | null;
+  elapsed?: number | null;
+  homeScore?: number | null;
+  awayScore?: number | null;
+  winner?: string | null;
+  lastUpdateTs?: string | null;
+  rawJson?: string | null;
+}
+
+export interface MatchEventInput {
+  fixtureKey: string;
+  source: string;
+  sourceFixtureId?: string | null;
+  eventKey: string;
+  minute?: number | null;
+  extraMinute?: number | null;
+  teamSide?: "home" | "away" | "unknown" | string | null;
+  teamName?: string | null;
+  playerName?: string | null;
+  assistName?: string | null;
+  eventType?: string | null;
+  detail?: string | null;
+  scoreHome?: number | null;
+  scoreAway?: number | null;
+  rawJson?: string | null;
+}
+
+export function upsertMatchResult(row: MatchResultInput): void {
+  stmtUpsertMatchResult.run(
+    row.fixtureKey,
+    row.source,
+    row.sourceFixtureId ?? null,
+    row.status ?? null,
+    row.elapsed ?? null,
+    row.homeScore ?? null,
+    row.awayScore ?? null,
+    row.winner ?? null,
+    row.lastUpdateTs ?? null,
+    row.rawJson ?? null
+  );
+}
+
+export const upsertMatchEvents = db.transaction((rows: MatchEventInput[]) => {
+  for (const row of rows) {
+    stmtUpsertMatchEvent.run(
+      row.fixtureKey,
+      row.source,
+      row.sourceFixtureId ?? null,
+      row.eventKey,
+      row.minute ?? null,
+      row.extraMinute ?? null,
+      row.teamSide ?? null,
+      row.teamName ?? null,
+      row.playerName ?? null,
+      row.assistName ?? null,
+      row.eventType ?? null,
+      row.detail ?? null,
+      row.scoreHome ?? null,
+      row.scoreAway ?? null,
+      row.rawJson ?? null
+    );
+  }
+  return rows.length;
+});
 
 export interface AiAnalysisRow {
   id: number;

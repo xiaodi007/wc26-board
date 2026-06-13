@@ -26,26 +26,36 @@ quick tunnel is the current workaround.
 
 ## Latest Deployment
 
-- Latest app rebuild/restart: 2026-06-13 13:33 CST
-- Deployed change: AI Betting Plan compact card + modal on home/match pages,
-  prompt language routing with English default and `?lang=zh` Chinese prompts,
-  plus `/walrus` manifest/artifact links and local JSON data previews.
+- Latest app rebuild/restart: 2026-06-13 14:52 CST
+- Deployed change: AI Betting Plan modal loading/error UX, local
+  `localStorage` plan persistence, clearer "can buy / watch / avoid" betting
+  list, score/result tables (`match_result`, `match_event`), `/api/match-events`,
+  API-Football result/event source wiring, The Odds API scores fallback, and
+  score-led `/review` odds replay.
+- Public demo URL remains:
+  `https://crossing-tide-extra-explicit.trycloudflare.com`.
 - Verification: `docker compose exec -T board npm run health` returned
-  `10 pass, 0 warn, 0 fail`.
-- `docker compose exec -T board npm run status` showed 140 source rows,
-  70 fixtures, and next-24h matches available.
-- Walrus testnet compact publish succeeded at 2026-06-13 13:34 CST using a
-  one-off public publisher endpoint injection:
-  manifest blob `xYuz11Otvz_gMjA5FJYDZQROBerh_sxTAolrp_MKC_o`, 4 artifacts,
-  725,443 bytes, empty `walrus_latest_error`.
-- AI smoke call to public `/api/analyze-board` with `1000` bankroll and `30`
-  max loss correctly returned `503 no_api_key` because the demo `.env` has no
-  provider key (`ANTHROPIC_API_KEY` missing). `/api/board-prompt` returns an
-  English prompt by default and `/api/board-prompt?lang=zh` returns Chinese.
+  `9 pass, 1 warn, 0 fail`. The only warn remained Sporttery freshness:
+  the hourly job is deployed, but the VPS currently receives `HTTP 567` from
+  the official Sporttery endpoint. PM, Kalshi, and Odds API were fresh, and the
+  daemon will retry Sporttery hourly.
+- `docker compose exec -T board npm run status` showed 142 source rows,
+  72 fixtures, PM/Kalshi fresh at 2026-06-13 06:51 UTC, and next-24h matches
+  available. Sporttery remained on the prior remote snapshot
+  `2026-06-12T13:59:28.924Z`.
+- Remote `.env` does not currently have `API_FOOTBALL_KEY`; `/review` therefore
+  shows the clear odds-only degradation. The daemon used The Odds API scores
+  fallback and upserted 4 `match_result` rows, but no goal-event timeline.
+- Internal API smoke passed: `/api/ai/providers` returned provider default
+  metadata; `/api/probability` returned candidates; `/api/match-events` returned
+  configured status; `/api/analyze-board` with `1000` bankroll and `30` max loss
+  correctly returned `no_api_key`.
 - Public quick-tunnel checks after deploy returned HTTP 200 for `/`,
-  `/?lang=en`, `/match?...&lang=en`, `/walrus?lang=en`, `/api/walrus`, and
-  `/api/board-prompt`. `/walrus?lang=en` includes Data Preview, Open
-  `/api/walrus`, and artifact action links.
+  `/?lang=en`, `/review?lang=zh`, `/match?...&lang=zh`, and
+  `/api/match-events?...`.
+
+The previous Walrus testnet compact publish from 2026-06-13 13:34 CST remains
+the latest recorded Walrus publish unless a new publish is run manually.
 
 The first request after a container recreate can be slower due to cold startup
 and SQLite cache warming. The Cloudflare quick tunnel still adds noticeable
@@ -176,6 +186,12 @@ Common variables:
 - `ODDS_API_KEY`
 - `PM_POLL_MS`
 - `KALSHI_POLL_MS`
+- `SPORTTERY_POLL_MS` (defaults to hourly polling)
+- `API_FOOTBALL_KEY` for scorelines and match events; if absent, review pages
+  clearly fall back to odds-only review, and The Odds API scores can provide
+  scorelines only
+- `API_FOOTBALL_BASE` (defaults to `https://v3.football.api-sports.io`)
+- `RESULTS_POLL_MS` (defaults to 10 minutes)
 - `ODDSAPI_POLL_MS`
 - `AI_PROVIDER` and the chosen provider key
 - `SERVERCHAN_KEY`
@@ -209,22 +225,29 @@ docker compose exec board npm run health
 docker compose exec board npm run status
 curl -I http://127.0.0.1:4627
 curl -s http://127.0.0.1:4627/api/walrus
+curl -s http://127.0.0.1:4627/api/match-events?fk=<fixture_key>
 ```
 
 Expected current health state after the initial VPS deployment was:
 
-- `pass: 10`
-- `warn: 0`
+- `pass: 9`
+- `warn: 1` if the VPS is still blocked by Sporttery `HTTP 567`; otherwise `0`
 - `fail: 0`
 
 Also open the public tunnel URL and check:
 
 - home page renders in Chinese and English with `?lang=zh` / `?lang=en`
+- `/review?lang=zh` loads the post-match odds replay page
 - match detail pages load
 - `/walrus?lang=zh` loads and `/api/walrus` shows latest manifest metadata
+- `/api/ai/providers` returns default provider metadata
+- `/api/probability?limit=1` returns candidates/skipped JSON
 - `/api/analyze-board?lang=zh` either returns a parsed plan when a provider key
   is configured or returns `no_api_key` without logging secret material
+- AI Betting Plan provider selection auto-fills DeepSeek/Kimi/Anthropic defaults
 - PM liquidity/participation panels show data or clear sampled/degraded states
+- Sporttery freshness should recover automatically when the official endpoint
+  accepts VPS requests again; until then health may keep one Sporttery warn
 - no obvious mobile overflow on a narrow viewport
 
 ## Capacity Notes

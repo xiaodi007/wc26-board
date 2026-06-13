@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { WALRUS_AGGREGATOR_URL, WALRUS_FEED_DIR } from "../config.js";
-import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "../queries/currentOdds.js";
+import { API_FOOTBALL_KEY, WALRUS_AGGREGATOR_URL, WALRUS_FEED_DIR } from "../config.js";
+import { getCompletedOdds, getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "../queries/currentOdds.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
 import { getSportteryEdges, type SportteryAvoidanceRow } from "../queries/sportteryAvoidance.js";
 import { getOutrightBoard } from "../queries/outright.js";
@@ -18,10 +18,12 @@ import {
   type RiskLevel,
   type RiskSignal,
 } from "../queries/marketIntelligence.js";
+import { getProbabilityCandidates, type ProbabilityCandidate, type SourceContribution } from "../queries/probabilityModel.js";
+import { getMatchEventBundle, type MatchEventBundle, type MatchEventRow } from "../queries/matchEvents.js";
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getAllSportteryHhad, getSportteryHhad, type HhadBoardRow } from "../queries/hhad.js";
 import { buildMatchContext } from "../ai/context.js";
-import { currentAiProvider, currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
+import { aiProviderOptions, currentAiProvider, currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
 import { latestBoardVerdict, type BoardBettingVerdict } from "../ai/boardPlan.js";
 import { countAlerts24h, getMeta, listAnalyses, listRecentAlerts, listWalrusPublishLog, type AiAnalysisRow } from "../db.js";
 import { normalizeTeam, zhTeamName } from "../teams.js";
@@ -53,6 +55,7 @@ const SOURCE_COLOR: Record<string, string> = {
   pinnacle: "var(--lime)",
   sporttery: "var(--amber)",
 };
+type PageActive = "home" | "opportunities" | "match" | "walrus" | "review";
 
 function esc(raw: string): string {
   return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -249,6 +252,220 @@ function trendChart(locale: Locale, fixtureKey: string): string {
   return `${legend}<div class="chart-grid">${LABELS.map(chart).join("")}</div>`;
 }
 
+function reviewWindow(row: CurrentOddsRow): { fromTs: string; toTs: string } {
+  const kickoff = Date.parse(row.kickoffUtc);
+  return {
+    fromTs: new Date(kickoff - 24 * 3600_000).toISOString(),
+    toTs: new Date(kickoff + 2.5 * 3600_000).toISOString(),
+  };
+}
+
+function reviewHistory(row: CurrentOddsRow): SourceLineHistory[] {
+  const window = reviewWindow(row);
+  return getLineHistory(row.fixtureKey, { fromTs: window.fromTs, toTs: window.toTs, bucketMinutes: 30 });
+}
+
+function eventMinuteLabel(locale: Locale, event: Pick<MatchEventRow, "minute" | "extraMinute">): string {
+  if (event.minute === null) return "-";
+  const extra = event.extraMinute && event.extraMinute > 0 ? `+${event.extraMinute}` : "";
+  return locale === "zh" ? `${event.minute}${extra} 分` : `${event.minute}${extra}'`;
+}
+
+function eventEpoch(row: CurrentOddsRow, event: MatchEventRow): number | null {
+  if (event.minute === null) return null;
+  const kickoff = Date.parse(row.kickoffUtc);
+  if (!Number.isFinite(kickoff)) return null;
+  return kickoff + (event.minute + (event.extraMinute ?? 0)) * 60_000;
+}
+
+function isGoalEvent(event: MatchEventRow): boolean {
+  return (event.eventType ?? "").toLowerCase() === "goal" && !/(missed|cancelled|canceled|disallowed)/i.test(event.detail ?? "");
+}
+
+function reviewGoalMarkers(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle): { t: number; label: string; color?: string }[] {
+  return bundle.events
+    .filter(isGoalEvent)
+    .map((event): { t: number; label: string; color?: string } | null => {
+      const t = eventEpoch(row, event);
+      if (t === null) return null;
+      const score = event.scoreHome !== null && event.scoreAway !== null ? `${event.scoreHome}-${event.scoreAway}` : eventMinuteLabel(locale, event);
+      return { t, label: score, color: "var(--amber)" };
+    })
+    .filter((row): row is { t: number; label: string; color?: string } => row !== null);
+}
+
+function reviewTrendChart(locale: Locale, row: CurrentOddsRow, history: SourceLineHistory[], markers: { t: number; label: string; color?: string }[] = []): string {
+  const drawnSources = history.filter((s) => SOURCE_COLOR[s.source] && s.points.length > 0);
+  if (!drawnSources.length) return `<p class="dim">${locale === "zh" ? "这场比赛暂无可复盘的赔率走势。" : "No reviewable odds history for this match yet."}</p>`;
+  const { fromTs, toTs } = reviewWindow(row);
+  const tMin = Date.parse(fromTs);
+  const tMax = Date.parse(toTs);
+  const chart = (label: Label): string => {
+    const series: ChartSeries[] = drawnSources.map((s) => ({
+      name: s.source,
+      color: SOURCE_COLOR[s.source],
+      dash: s.source === "kalshi" ? "5 3" : undefined,
+      markersOnly: s.source === "sporttery",
+      points: s.points.map((p) => ({ t: Date.parse(p.ts), v: p.probs[label] })),
+    }));
+    return `<div class="chart-cell"><div class="chart-title">${esc(outcomeLabel(locale, label))}</div>${lineChart(series, { tMin, tMax, markers })}</div>`;
+  };
+  const legend = `<div class="legend">${drawnSources.map((s) => `<span><i style="background:${SOURCE_COLOR[s.source]}"></i>${esc(s.source)}</span>`).join("")}</div>`;
+  return `${legend}<div class="chart-grid">${LABELS.map(chart).join("")}</div>`;
+}
+
+function sourcePriority(source: string): number {
+  if (source === "polymarket") return 0;
+  if (source === "kalshi") return 1;
+  if (source === "pinnacle") return 2;
+  if (source === "sporttery") return 3;
+  return 9;
+}
+
+function reviewJumpRows(history: SourceLineHistory[]): { source: string; label: Label; deltaPp: number; ts: string }[] {
+  return history
+    .flatMap((s) => s.jumps.map((j) => ({ ...j, source: s.source })))
+    .sort((a, b) => sourcePriority(a.source) - sourcePriority(b.source) || Math.abs(b.deltaPp) - Math.abs(a.deltaPp));
+}
+
+function nearestGoalPhrase(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle, ts: string): string {
+  const t = Date.parse(ts);
+  if (!Number.isFinite(t)) return "";
+  const candidates = bundle.events
+    .filter(isGoalEvent)
+    .map((event) => ({ event, t: eventEpoch(row, event) }))
+    .filter((item): item is { event: MatchEventRow; t: number } => item.t !== null && item.t <= t && t - item.t <= 45 * 60_000)
+    .sort((a, b) => b.t - a.t);
+  const hit = candidates[0];
+  if (!hit) return "";
+  return locale === "zh" ? `，主要转折发生在${eventMinuteLabel(locale, hit.event)}后` : `, mostly after ${eventMinuteLabel(locale, hit.event)}`;
+}
+
+function reviewKeyTurn(locale: Locale, row: CurrentOddsRow, history: SourceLineHistory[], bundle: MatchEventBundle): string {
+  const jump = reviewJumpRows(history).find((row) => sourcePriority(row.source) < 9) ?? reviewJumpRows(history)[0];
+  if (!jump) return locale === "zh" ? "没有明显市场转折" : "No obvious market turn";
+  const afterGoal = nearestGoalPhrase(locale, row, bundle, jump.ts);
+  return `${jump.source} ${outcomeLabel(locale, jump.label)} ${signedPp(jump.deltaPp)}pp @ ${fullTime(locale, new Date(jump.ts))}${afterGoal}`;
+}
+
+function reviewAllJumps(locale: Locale, history: SourceLineHistory[]): string {
+  const rows = reviewJumpRows(history).slice(0, 12);
+  if (!rows.length) return `<p class="dim">${locale === "zh" ? "没有 >=2pp 的相邻窗口跳变。" : "No >=2pp adjacent-bucket jumps."}</p>`;
+  return rows
+    .map((jump) => `<div class="muted-line"><span class="badge ${sourcePriority(jump.source) < 9 ? "info" : "mute"}">${esc(jump.source)}</span>${esc(outcomeLabel(locale, jump.label))} <b class="${jump.deltaPp >= 0 ? "pos" : "neg"}">${signedPp(jump.deltaPp)}pp</b> @ ${esc(fullTime(locale, new Date(jump.ts)))}</div>`)
+    .join("");
+}
+
+function reviewPmMove(locale: Locale, row: CurrentOddsRow, history: SourceLineHistory[], bundle: MatchEventBundle): string {
+  const pm = history.find((s) => s.source === "polymarket");
+  if (!pm || pm.points.length < 2) return locale === "zh" ? "PM 数据不足" : "PM data insufficient";
+  const first = pm.points[0];
+  const last = pm.points[pm.points.length - 1];
+  const label = LABELS.map((outcome) => ({ outcome, delta: (last.probs[outcome] - first.probs[outcome]) * 100 })).sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))[0];
+  const afterGoal = nearestGoalPhrase(locale, row, bundle, last.ts);
+  if (locale === "zh") {
+    const verb = label.delta >= 0 ? "升到" : "降到";
+    return `PM 对${outcomeLabel(locale, label.outcome)}的判断从 ${pct(first.probs[label.outcome], 0)} ${verb} ${pct(last.probs[label.outcome], 0)}（${signedPp(label.delta)}pp）${afterGoal}`;
+  }
+  return `PM moved ${outcomeLabel(locale, label.outcome)} from ${pct(first.probs[label.outcome], 0)} to ${pct(last.probs[label.outcome], 0)} (${signedPp(label.delta)}pp)${afterGoal}`;
+}
+
+function resultStatusLabel(locale: Locale, status: string | null): string {
+  if (!status) return "-";
+  if (locale !== "zh") return status;
+  const map: Record<string, string> = {
+    FT: "完场",
+    AET: "加时完",
+    PEN: "点球完",
+    HT: "中场",
+    "1H": "上半场",
+    "2H": "下半场",
+    NS: "未开赛",
+    LIVE: "进行中",
+  };
+  return map[status] ?? status;
+}
+
+function reviewScoreboard(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle): string {
+  const result = bundle.result;
+  const home = team(locale, row.homeTeam);
+  const away = team(locale, row.awayTeam);
+  if (result?.homeScore !== null && result?.homeScore !== undefined && result?.awayScore !== null && result?.awayScore !== undefined) {
+    return (
+      `<div class="review-scoreboard">` +
+      `<div><span>${esc(home)}</span><b>${result.homeScore}</b></div>` +
+      `<strong>${esc(resultStatusLabel(locale, result.status))}</strong>` +
+      `<div><span>${esc(away)}</span><b>${result.awayScore}</b></div>` +
+      `</div>`
+    );
+  }
+  const gap = API_FOOTBALL_KEY
+    ? locale === "zh"
+      ? "赛果源已配置，但这场暂未匹配到比分；先展示赔率复盘。"
+      : "Result source is configured, but this match has not been matched yet; showing odds review only."
+    : locale === "zh"
+      ? "未配置 API_FOOTBALL_KEY，当前只能做赔率复盘。"
+      : "API_FOOTBALL_KEY is not configured, so this is odds review only.";
+  return `<div class="review-scoreboard empty"><div><span>${esc(home)}</span><b>-</b></div><strong>${esc(gap)}</strong><div><span>${esc(away)}</span><b>-</b></div></div>`;
+}
+
+function eventSideLabel(locale: Locale, row: CurrentOddsRow, event: MatchEventRow): string {
+  if (event.teamSide === "home") return team(locale, row.homeTeam);
+  if (event.teamSide === "away") return team(locale, row.awayTeam);
+  return event.teamName ? team(locale, event.teamName) : (locale === "zh" ? "未知球队" : "Unknown team");
+}
+
+function eventScoreText(event: MatchEventRow): string {
+  return event.scoreHome !== null && event.scoreAway !== null ? `${event.scoreHome}-${event.scoreAway}` : "";
+}
+
+function eventText(locale: Locale, row: CurrentOddsRow, event: MatchEventRow): string {
+  const type = event.detail || event.eventType || (locale === "zh" ? "事件" : "Event");
+  const player = event.playerName ? ` · ${event.playerName}` : "";
+  const assist = event.assistName ? (locale === "zh" ? `（助攻 ${event.assistName}）` : ` (assist ${event.assistName})`) : "";
+  return `${eventSideLabel(locale, row, event)} · ${type}${player}${assist}`;
+}
+
+function reviewTimeline(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle): string {
+  if (!bundle.events.length) {
+    const text = bundle.result
+      ? locale === "zh"
+        ? "已拿到比分，但当前来源不提供进球事件；接入 API-Football 后会显示时间轴。"
+        : "Score is available, but this source does not provide goal events. API-Football will add the timeline."
+      : API_FOOTBALL_KEY
+        ? locale === "zh"
+          ? "这场暂未匹配到进球事件。"
+          : "No matched event timeline for this match yet."
+        : locale === "zh"
+          ? "未配置 API_FOOTBALL_KEY，暂无进球时间轴。"
+          : "API_FOOTBALL_KEY is not configured, so no goal timeline is available.";
+    return `<div class="event-timeline empty">${esc(text)}</div>`;
+  }
+  const shown = bundle.events.filter((event) => isGoalEvent(event) || ["Card", "subst", "Var"].includes(event.eventType ?? "")).slice(0, 18);
+  if (!shown.length) return `<div class="event-timeline empty">${locale === "zh" ? "有事件源，但暂无进球/关键事件。" : "Events are available, but no goal/key event is present."}</div>`;
+  return (
+    `<div class="event-timeline">` +
+    shown
+      .map((event) => {
+        const score = eventScoreText(event);
+        return `<div class="event-item ${isGoalEvent(event) ? "goal" : ""}"><span class="mono">${esc(eventMinuteLabel(locale, event))}</span><b>${score ? esc(score) : " "}</b><p>${esc(eventText(locale, row, event))}</p></div>`;
+      })
+      .join("") +
+    `</div>`
+  );
+}
+
+function matchEventsPanel(locale: Locale, row: CurrentOddsRow): string {
+  const bundle = getMatchEventBundle(row.fixtureKey);
+  if (!bundle.result && !bundle.events.length && !row.live && Date.parse(row.kickoffUtc) > Date.now()) return "";
+  return (
+    `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "比分与事件" : "Score & Events"}</h2><a href="/api/match-events?fk=${encodeURIComponent(row.fixtureKey)}">JSON</a></div>` +
+    reviewScoreboard(locale, row, bundle) +
+    `<div style="margin-top:12px">${reviewTimeline(locale, row, bundle)}</div>` +
+    `</section>`
+  );
+}
+
 function freshnessGroup(locale: Locale, group: string): string {
   if (locale === "zh") return group;
   if (group === "书商") return "Books";
@@ -328,19 +545,27 @@ function bettingPlanPanel(locale: Locale, model: ReturnType<typeof getMarketRada
   const latest = latestBoardVerdict();
   const latestVerdict = latest?.verdict ?? null;
   const provider = currentAiProvider();
+  const providerMeta = aiProviderOptions();
   const title = fixtureKey ? (locale === "zh" ? "本场投注计划" : "Match Betting Plan") : (locale === "zh" ? "AI 投注计划" : "AI Betting Plan");
   const hint = locale === "zh"
     ? "金额只在浏览器本次计算使用，不保存。默认 25% Kelly、单注最多 1% 本金，并受最大日亏损限制。"
     : "Amounts are used only for this browser request. Defaults: 25% Kelly, 1% max stake per pick, capped by max daily loss.";
   const matchNames = Object.fromEntries(model.matches.map((m) => [m.row.fixtureKey, matchNameFromRow(locale, m.row)]));
-  const providerOptions = [
-    ["anthropic", "Anthropic"],
-    ["deepseek", "DeepSeek"],
-    ["kimi", "Kimi"],
-    ["openai-compatible", "OpenAI-compatible"],
-  ]
-    .map(([id, label]) => `<option value="${id}"${provider.id === id ? " selected" : ""}>${label}</option>`)
+  const matchTeams = Object.fromEntries(
+    model.matches.map((m) => [
+      m.row.fixtureKey,
+      {
+        home: localizedTeam(locale, m.row.homeTeam),
+        away: localizedTeam(locale, m.row.awayTeam),
+        match: matchNameFromRow(locale, m.row),
+      },
+    ])
+  );
+  const providerOptions = providerMeta
+    .map(({ id, label }) => `<option value="${id}"${provider.id === id ? " selected" : ""}>${label}</option>`)
     .join("");
+  const currentMeta = providerMeta.find((p) => p.id === provider.id);
+  const currentThinking = currentMeta?.defaultThinking === "enabled";
   return (
     `<section class="panel plan-panel plan-card" id="betting-plan">` +
     `<div class="panel-head"><h2>${esc(title)}</h2><span class="badge info">${locale === "zh" ? "25% Kelly 模拟" : "25% Kelly simulation"}</span></div>` +
@@ -356,19 +581,33 @@ function bettingPlanPanel(locale: Locale, model: ReturnType<typeof getMarketRada
     `<label>Provider<select id="plan-provider">${providerOptions}</select></label>` +
     `<label>Base URL<input id="plan-base" value="${esc(provider.baseUrl)}" placeholder="https://api.example.com/v1" autocomplete="off"></label>` +
     `<label>Model<input id="plan-model" value="${esc(provider.model === "(未配置)" ? "" : provider.model)}" placeholder="model" autocomplete="off"></label>` +
+    `<label class="switch-label">Thinking<span class="switch-row"><input id="plan-thinking" type="checkbox"${currentThinking ? " checked" : ""}${currentMeta?.thinkingSupported ? "" : " disabled"}><span>${locale === "zh" ? "深度思考" : "Reasoning"}</span></span></label>` +
     `<label>API key<input id="plan-key" type="password" placeholder="${esc(provider.requiredKeyName)}" autocomplete="off"></label>` +
     `</div>` +
-    `<div class="mini" style="margin:10px 0"><button id="plan-go" type="button" class="btn primary" onclick="generateBettingPlan()">${fixtureKey ? (locale === "zh" ? "按当前本金生成本场计划" : "Generate match plan") : (locale === "zh" ? "生成投注计划" : "Generate betting plan")}</button><button type="button" class="btn" onclick="copyBoardPrompt()">${locale === "zh" ? "复制完整 prompt" : "Copy full prompt"}</button></div>` +
+    `<details class="plan-advanced"><summary>${locale === "zh" ? "高级设置" : "Advanced settings"}</summary><div class="plan-config compact-config"><label>Max tokens<input id="plan-max-tokens" type="number" min="1" step="1" placeholder="${locale === "zh" ? "留空=不限制兼容接口" : "blank = provider default"}" autocomplete="off"></label></div></details>` +
+    `<div class="mini" style="margin:10px 0"><button id="plan-go" type="button" class="btn primary" onclick="generateBettingPlan()">${fixtureKey ? (locale === "zh" ? "按当前本金生成本场计划" : "Generate match plan") : (locale === "zh" ? "生成投注计划" : "Generate betting plan")}</button><button type="button" class="btn" onclick="copyBoardPrompt()">${locale === "zh" ? "复制完整 prompt" : "Copy full prompt"}</button><button type="button" class="btn" onclick="copyBettingList()">${locale === "zh" ? "复制投注清单" : "Copy bet list"}</button><button type="button" class="btn" onclick="clearLocalPlan()">${locale === "zh" ? "清除本地计划" : "Clear local plan"}</button></div>` +
+    `<div id="plan-progress" class="plan-progress" hidden><b>${locale === "zh" ? "AI 正在读盘" : "AI is reading the board"}</b><span id="plan-progress-text">${locale === "zh" ? "已等待 0 秒；通常 20-90 秒。" : "Waited 0s; usually 20-90s."}</span></div>` +
     `<div id="plan-output">${latestBettingSummary(locale, latestVerdict)}</div>` +
     `</div>` +
     `</section>` +
     `</div>` +
     `<script>
 window.__matchNames=${JSON.stringify(matchNames)};
+window.__matchTeams=${JSON.stringify(matchTeams)};
 window.__planFixture=${JSON.stringify(fixtureKey ?? "")};
-function planMoney(v){ return Number.isFinite(v) ? v.toLocaleString(undefined,{maximumFractionDigits:2}) : "-"; }
+window.__aiProviders=${JSON.stringify(Object.fromEntries(providerMeta.map((p) => [p.id, p])))};
+window.__lastPlanData=null;
+window.__planAbortController=null;
+function planMoney(v){ return Number.isFinite(v) ? "¥"+v.toLocaleString(undefined,{maximumFractionDigits:2}) : "-"; }
 function planPct(v){ return Number.isFinite(v) ? (v*100).toFixed(1)+"%" : "-"; }
-function planOutcome(row){ return (row.outcome||"").toUpperCase(); }
+function planSignedPp(v){ return Number.isFinite(v) ? (v>=0?"+":"")+v.toFixed(1)+"pp" : "-"; }
+function planOutcome(row){
+  var teams=(window.__matchTeams||{})[row.fixture_key] || {};
+  if(row.outcome==="home") return ${JSON.stringify(locale === "zh" ? "主胜" : "Home")}+(teams.home?"（"+teams.home+"）":"");
+  if(row.outcome==="away") return ${JSON.stringify(locale === "zh" ? "客胜" : "Away")}+(teams.away?"（"+teams.away+"）":"");
+  if(row.outcome==="draw") return ${JSON.stringify(locale === "zh" ? "平局" : "Draw")};
+  return String(row.outcome||"");
+}
 function h(v){ return String(v==null?"":v).replace(/[&<>"]/g,function(c){ if(c==="&") return "&amp;"; if(c==="<") return "&lt;"; if(c===">") return "&gt;"; return "&quot;"; }); }
 function explicitPlanLang(){
   var lang=new URLSearchParams(location.search).get("lang");
@@ -387,12 +626,58 @@ function planPromptUrl(){
   if(lang) params.set("lang", lang);
   return "/api/board-prompt" + (params.toString() ? "?" + params.toString() : "");
 }
+function localPlanKey(){
+  var lang=explicitPlanLang() || ${JSON.stringify(locale)};
+  return "wc26.plan.v1:"+lang+":"+(window.__planFixture || "all");
+}
+function setPlanStatus(text){
+  var status=document.getElementById("plan-status");
+  if(status) status.textContent=text||"";
+}
+function planOutput(html){
+  var out=document.getElementById("plan-output");
+  if(out) out.innerHTML=html;
+}
+function saveLocalPlan(data, body){
+  if(!data || !data.plan || !data.verdict) return;
+  var saved={verdict:data.verdict,plan:data.plan,model:data.model||"",generatedAt:new Date().toISOString(),bankroll:body.bankroll,maxDailyLoss:body.maxDailyLoss,provider:body.provider,constants:data.constants||null};
+  try{ localStorage.setItem(localPlanKey(), JSON.stringify(saved)); }catch(e){}
+  window.__lastPlanData=saved;
+}
+function loadLocalPlan(){
+  try{
+    var raw=localStorage.getItem(localPlanKey());
+    if(!raw) return null;
+    var parsed=JSON.parse(raw);
+    if(!parsed || !parsed.plan || !parsed.verdict) return null;
+    return parsed;
+  }catch(e){ return null; }
+}
+function restoreLocalPlan(){
+  var saved=loadLocalPlan();
+  if(!saved) return false;
+  window.__lastPlanData=saved;
+  var bankroll=document.getElementById("plan-bankroll");
+  var loss=document.getElementById("plan-loss");
+  if(bankroll && !bankroll.value && saved.bankroll) bankroll.value=saved.bankroll;
+  if(loss && !loss.value && saved.maxDailyLoss) loss.value=saved.maxDailyLoss;
+  renderPlan(saved,{fromLocal:true});
+  setPlanStatus(${JSON.stringify(locale === "zh" ? "已恢复本地计划" : "Restored local plan")});
+  return true;
+}
+function clearLocalPlan(){
+  try{ localStorage.removeItem(localPlanKey()); }catch(e){}
+  window.__lastPlanData=null;
+  planOutput("<div class='plan-empty'>${locale === "zh" ? "本地计划已清除。可以重新生成，或复制 prompt 到外部 AI。" : "Local plan cleared. Generate again or copy the prompt."}</div>");
+  setPlanStatus(${JSON.stringify(locale === "zh" ? "本地计划已清除" : "Local plan cleared")});
+}
 function openBettingPlan(){
   var modal=document.getElementById("plan-modal");
   if(!modal) return;
   modal.hidden=false;
   document.body.classList.add("modal-open");
   window.__pauseAutoRefresh=true;
+  restoreLocalPlan();
   setTimeout(function(){ var el=document.getElementById("plan-bankroll") || document.getElementById("plan-go"); if(el) el.focus(); }, 0);
 }
 function closeBettingPlan(){
@@ -411,42 +696,126 @@ function planInputs(){
     provider: document.getElementById("plan-provider").value,
     baseUrl: document.getElementById("plan-base").value,
     model: document.getElementById("plan-model").value,
+    thinking: document.getElementById("plan-thinking").checked ? "enabled" : "disabled",
+    maxTokens: document.getElementById("plan-max-tokens").value,
     apiKey: document.getElementById("plan-key").value
   };
 }
-function renderPlan(data){
-  var out=document.getElementById("plan-output");
-  if(!data || !data.plan || !data.verdict){ out.innerHTML="<div class='plan-empty'>${locale === "zh" ? "AI 没有返回可解析计划。" : "AI did not return a parsable plan."}</div>"; return; }
+function syncPlanProviderDefaults(){
+  var providerId=document.getElementById("plan-provider").value;
+  var meta=(window.__aiProviders||{})[providerId] || {};
+  var base=document.getElementById("plan-base");
+  var model=document.getElementById("plan-model");
+  var thinking=document.getElementById("plan-thinking");
+  if(base && base.dataset.userEdited!=="1"){
+    base.value=meta.baseUrl || "";
+    base.placeholder=meta.baseUrl || "https://api.example.com/v1";
+  }
+  if(model && model.dataset.userEdited!=="1"){
+    model.value=meta.modelHint || "";
+    model.placeholder=meta.modelHint || "model";
+  }
+  if(thinking){
+    thinking.disabled=!meta.thinkingSupported;
+    thinking.checked=meta.defaultThinking==="enabled";
+  }
+}
+function planSourceLine(data, opts){
+  var parts=[];
+  if(data.generatedAt) parts.push(${JSON.stringify(locale === "zh" ? "生成" : "Generated")}+" "+new Date(data.generatedAt).toLocaleString());
+  if(data.model) parts.push("model "+data.model);
+  if(data.provider) parts.push("provider "+data.provider);
+  if(opts && opts.fromLocal) parts.push(${JSON.stringify(locale === "zh" ? "本机保存" : "local saved")});
+  return parts.length ? "<div class='muted-line'>"+parts.map(h).join(" · ")+"</div>" : "";
+}
+function readableVerdict(data){
+  var s=data.plan.summary || {};
+  var bets=(data.plan.rows||[]).filter(function(r){return r.bucket==="bet" && r.stake>0;});
+  if(!bets.length) return ${JSON.stringify(locale === "zh" ? "今天不建议下注：没有方向同时满足正 EV、赔率和风险门槛。" : "No bet recommended: no direction clears EV, price, and risk thresholds.")};
+  return ${JSON.stringify(locale === "zh" ? "当前建议 " : "Recommended ")}+bets.length+${JSON.stringify(locale === "zh" ? " 注，总金额 " : " bets, total stake ")}+planMoney(s.totalStake)+${JSON.stringify(locale === "zh" ? "，最坏亏损 " : ", worst loss ")}+planMoney(s.worstCaseLoss)+"。";
+}
+function betCard(r){
+  var match=window.__matchNames[r.fixture_key] || r.fixture_key;
+  return "<div class='plan-bet-card'><div><div class='opp-title'>${locale === "zh" ? "买 " : "Buy "}"+h(planOutcome(r))+" · "+h(match)+"</div><p class='opp-note'>"+h(r.offeredOdd.platform)+" · ${locale === "zh" ? "赔率" : "odds"} "+Number(r.offeredOdd.decimalOdds).toFixed(3)+" · ${locale === "zh" ? "建议金额" : "stake"} <b>"+planMoney(r.stake)+"</b> · ${locale === "zh" ? "最大亏损" : "max loss"} "+planMoney(r.maxLoss)+" · EV "+planMoney(r.expectedValue)+"</p><p class='opp-note'>"+h(r.reason||"")+"</p><div class='muted-line'>${locale === "zh" ? "撤销条件" : "Cancel if"}: "+h(r.cancel_if||"-")+"</div><div class='muted-line'>${locale === "zh" ? "风险" : "Risk"}: "+h(r.risk||"-")+"</div></div><div class='plan-numbers'><span>${locale === "zh" ? "模型概率" : "Model p"} <b>"+planPct(r.estimated_probability)+"</b></span><span>${locale === "zh" ? "市场概率" : "Market p"} <b>"+planPct(r.marketImpliedProbability)+"</b></span><span>Edge <b class='"+(r.edgePp>=0?"pos":"neg")+"'>"+planSignedPp(r.edgePp)+"</b></span><span>EV/stake <b>"+planPct(r.evPctStake)+"</b></span></div></div>";
+}
+function planItemRows(rows, type){
+  if(!rows.length) return "<div class='plan-empty'>"+(type==="watch"?${JSON.stringify(locale === "zh" ? "暂无需要等待的方向。" : "No watch-only directions.")}:${JSON.stringify(locale === "zh" ? "暂无明确避坑项。" : "No explicit avoid items.")})+"</div>";
+  return rows.map(function(r){
+    var match=window.__matchNames[r.fixture_key]||r.fixture_key;
+    var main=type==="watch" ? (r.trigger||r.take||"") : (r.take||"");
+    return "<div class='plan-lite-row'><b>"+h(match)+" · "+h(planOutcome(r))+"</b><p>"+h(main||"-")+"</p><span>"+h(r.risk||"")+"</span></div>";
+  }).join("");
+}
+function renderPlan(data, opts){
+  if(!data || !data.plan || !data.verdict){ planOutput("<div class='plan-empty'>${locale === "zh" ? "AI 没有返回可解析计划。" : "AI did not return a parsable plan."}</div>"); return; }
+  window.__lastPlanData=data;
   var s=data.plan.summary;
   var bets=data.plan.rows.filter(function(r){return r.bucket==="bet" && r.stake>0;});
   var watch=(data.verdict.watchlist||[]).slice(0,6);
   var avoid=(data.verdict.avoid||[]).slice(0,6);
+  var formula="<details class='details-panel'><summary>${locale === "zh" ? "公式细节" : "Formula details"}</summary><p class='opp-note'>Kelly fraction = 25% × raw Kelly；单注上限 = 本金 1%；总下注受最大日亏损限制。EV = stake × (model_probability × decimal_odds - 1)。这里只是个人研究，不保证收益。</p></details>";
   var summary="<div class='plan-summary'><div><span>${locale === "zh" ? "总下注" : "Total stake"}</span><b>"+planMoney(s.totalStake)+"</b></div><div><span>${locale === "zh" ? "最坏亏损" : "Worst loss"}</span><b>"+planMoney(s.worstCaseLoss)+"</b></div><div><span>${locale === "zh" ? "全中净收益" : "All-win profit"}</span><b>"+planMoney(s.allWinNetProfit)+"</b></div><div><span>${locale === "zh" ? "期望收益" : "Expected value"}</span><b>"+planMoney(s.expectedValue)+"</b></div><div><span>${locale === "zh" ? "预计亏损概率" : "Approx. loss prob."}</span><b>"+(s.approximateLossProbability===null?"-":planPct(s.approximateLossProbability))+"</b></div></div>";
-  var betHtml=bets.length ? bets.map(function(r){
-    var match=window.__matchNames[r.fixture_key] || r.fixture_key;
-    return "<div class='plan-row'><div><b>"+h(match)+" · "+h(planOutcome(r))+"</b><div class='opp-note'>"+h(r.offeredOdd.platform)+" @ "+r.offeredOdd.decimalOdds.toFixed(3)+" · AI "+planPct(r.estimated_probability)+" · market "+planPct(r.marketImpliedProbability)+" · edge "+r.edgePp.toFixed(1)+"pp</div><p class='opp-note'>"+h(r.reason)+"</p><div class='muted-line'>${locale === "zh" ? "撤销条件" : "Cancel if"}: "+h(r.cancel_if)+"</div><div class='muted-line'>${locale === "zh" ? "风险" : "Risk"}: "+h(r.risk)+"</div></div><div class='plan-numbers'><span>${locale === "zh" ? "下注" : "Stake"} <b>"+planMoney(r.stake)+"</b></span><span>${locale === "zh" ? "胜则净赚" : "Profit if win"} <b>"+planMoney(r.netProfitIfWin)+"</b></span><span>${locale === "zh" ? "亏损上限" : "Max loss"} <b>"+planMoney(r.maxLoss)+"</b></span><span>EV <b>"+planMoney(r.expectedValue)+"</b></span></div></div>";
-  }).join("") : "<div class='plan-empty'>${locale === "zh" ? "当前没有达到正 EV + 2pp 门槛的下注建议。" : "No pick cleared the positive-EV + 2pp threshold."}</div>";
-  function smallRows(rows,label){
-    return "<div class='plan-small'><div class='opp-title'>"+h(label)+"</div>"+(rows.length?rows.map(function(r){var match=window.__matchNames[r.fixture_key]||r.fixture_key; return "<div class='muted-line'><b>"+h(match)+" · "+h(planOutcome(r))+"</b> "+h(r.take||r.trigger||"")+" <span class='dim'>"+h(r.risk||"")+"</span></div>";}).join(""):"<div class='muted-line'>-</div>")+"</div>";
-  }
-  out.innerHTML="<p class='hero-sub'>"+h(data.verdict.summary_zh)+"</p>"+summary+"<div class='plan-section'><div class='opp-title'>${locale === "zh" ? "建议下注" : "Recommended bets"}</div>"+betHtml+"</div>"+smallRows(watch,"${locale === "zh" ? "谨慎观察" : "Watchlist"}")+smallRows(avoid,"${locale === "zh" ? "不下注 / 避坑" : "No bet / avoid"}")+"<div class='muted-line'>${locale === "zh" ? "组合概率按独立事件近似,实际比赛之间可能相关。" : "Portfolio probabilities assume independence; real matches may be correlated."}</div>";
+  var betHtml=bets.length ? bets.map(betCard).join("") : "<div class='plan-empty'>${locale === "zh" ? "当前没有达到正 EV + 2pp 门槛的下注建议。" : "No pick cleared the positive-EV + 2pp threshold."}</div>";
+  planOutput("<div class='plan-verdict'>"+h(readableVerdict(data))+"</div>"+planSourceLine(data,opts)+"<p class='hero-sub'>"+h(data.verdict.summary_zh||"")+"</p>"+summary+"<div class='plan-bucket good'><h3>${locale === "zh" ? "可以买" : "Can buy"}</h3>"+betHtml+"</div><div class='plan-bucket watch'><h3>${locale === "zh" ? "先观察" : "Watch first"}</h3>"+planItemRows(watch,'watch')+"</div><div class='plan-bucket avoid'><h3>${locale === "zh" ? "别买 / 避坑" : "Avoid"}</h3>"+planItemRows(avoid,'avoid')+"</div>"+formula);
   var card=document.getElementById("plan-card-copy");
   if(card){
-    card.innerHTML="<p class='hero-sub'>"+h(data.verdict.summary_zh)+"</p><div class='mini' style='margin-top:8px'><span class='chip ok'>${locale === "zh" ? "推荐" : "Picks"} <b>"+(data.verdict.recommendations||[]).length+"</b></span><span class='chip'>${locale === "zh" ? "观察" : "Watch"} <b>"+watch.length+"</b></span><span class='chip'>${locale === "zh" ? "避开" : "Avoid"} <b>"+avoid.length+"</b></span></div><div class='muted-line'>${locale === "zh" ? "资金纪律" : "Bankroll"}: "+h(data.verdict.bankroll_note||"-")+"</div><div class='muted-line'>${locale === "zh" ? "数据质量" : "Data quality"}: "+h(data.verdict.data_quality||"-")+"</div>";
+    card.innerHTML="<p class='hero-sub'>"+h(readableVerdict(data))+"</p><div class='mini' style='margin-top:8px'><span class='chip ok'>${locale === "zh" ? "可以买" : "Buy"} <b>"+bets.length+"</b></span><span class='chip'>${locale === "zh" ? "观察" : "Watch"} <b>"+watch.length+"</b></span><span class='chip'>${locale === "zh" ? "避开" : "Avoid"} <b>"+avoid.length+"</b></span></div><div class='muted-line'>${locale === "zh" ? "资金纪律" : "Bankroll"}: "+h(data.verdict.bankroll_note||"-")+"</div><div class='muted-line'>${locale === "zh" ? "数据质量" : "Data quality"}: "+h(data.verdict.data_quality||"-")+"</div>";
   }
 }
+function setPlanBusy(b){
+  window.__busy=b;
+  var btn=document.getElementById("plan-go");
+  if(btn){ btn.disabled=b; btn.textContent=b?${JSON.stringify(locale === "zh" ? "生成中..." : "Generating...")}:${JSON.stringify(fixtureKey ? (locale === "zh" ? "按当前本金生成本场计划" : "Generate match plan") : (locale === "zh" ? "生成投注计划" : "Generate betting plan"))}; }
+}
+function showPlanError(title, detail){
+  planOutput("<div class='plan-empty plan-error'><b>"+h(title)+"</b><pre>"+h(detail||"")+"</pre></div>");
+}
 async function generateBettingPlan(){
-  window.__busy=true;
-  var status=document.getElementById("plan-status"); if(status) status.textContent=${JSON.stringify(locale === "zh" ? "生成中..." : "Generating...")};
+  setPlanBusy(true);
+  setPlanStatus(${JSON.stringify(locale === "zh" ? "生成中..." : "Generating...")});
+  var progress=document.getElementById("plan-progress");
+  var progressText=document.getElementById("plan-progress-text");
+  if(progress) progress.hidden=false;
+  var started=Date.now();
+  var slowNotice=false;
+  var timer=setInterval(function(){
+    var sec=Math.floor((Date.now()-started)/1000);
+    if(sec>=120) slowNotice=true;
+    if(progressText) progressText.textContent=slowNotice?${JSON.stringify(locale === "zh" ? "已等待 " : "Waited ")}+sec+${JSON.stringify(locale === "zh" ? " 秒；仍在等待，可继续等或稍后重试。" : "s; still waiting. You can keep waiting or retry later.")}:${JSON.stringify(locale === "zh" ? "已等待 " : "Waited ")}+sec+${JSON.stringify(locale === "zh" ? " 秒；通常 20-90 秒。" : "s; usually 20-90s.")};
+  },1000);
   try{
     var body=planInputs();
-    var res=await fetch(planApiUrl("/api/analyze-board"),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    window.__planAbortController=new AbortController();
+    var res=await fetch(planApiUrl("/api/analyze-board"),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body),signal:window.__planAbortController.signal});
     var data=await res.json();
     if(!res.ok) throw new Error(data.message||data.error||res.status);
+    data.generatedAt=new Date().toISOString();
+    data.provider=body.provider;
+    saveLocalPlan(data, body);
     renderPlan(data);
-    if(status) status.textContent=${JSON.stringify(locale === "zh" ? "完成" : "Done")};
-  }catch(e){ if(status) status.textContent=(${JSON.stringify(locale === "zh" ? "失败: " : "Failed: ")})+e.message; }
-  finally{ window.__busy=false; }
+    setPlanStatus(${JSON.stringify(locale === "zh" ? "完成，已保存到本机" : "Done, saved locally")});
+  }catch(e){
+    var msg=e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    setPlanStatus((${JSON.stringify(locale === "zh" ? "失败: " : "Failed: ")})+(e.message||String(e)));
+    showPlanError(${JSON.stringify(locale === "zh" ? "生成失败" : "Generation failed")}, msg);
+  }
+  finally{ clearInterval(timer); if(progress) progress.hidden=true; setPlanBusy(false); window.__planAbortController=null; }
+}
+function bettingListText(data){
+  if(!data || !data.plan) return ${JSON.stringify(locale === "zh" ? "暂无本地投注计划" : "No local betting plan")};
+  var bets=(data.plan.rows||[]).filter(function(r){return r.bucket==="bet" && r.stake>0;});
+  var lines=[readableVerdict(data)];
+  bets.forEach(function(r){
+    var match=window.__matchNames[r.fixture_key]||r.fixture_key;
+    lines.push("买 "+planOutcome(r)+" · "+match+" · "+r.offeredOdd.platform+" @ "+Number(r.offeredOdd.decimalOdds).toFixed(3)+" · "+planMoney(r.stake)+" · max loss "+planMoney(r.maxLoss)+" · EV "+planMoney(r.expectedValue));
+  });
+  if(!bets.length) lines.push(${JSON.stringify(locale === "zh" ? "没有满足条件的下注。" : "No qualifying bets.")});
+  return lines.join("\\n");
+}
+async function copyBettingList(){
+  var data=window.__lastPlanData || loadLocalPlan();
+  await navigator.clipboard.writeText(bettingListText(data));
+  setPlanStatus(${JSON.stringify(locale === "zh" ? "投注清单已复制" : "Bet list copied")});
 }
 async function copyBoardPrompt(){
   var status=document.getElementById("plan-status");
@@ -457,7 +826,13 @@ async function copyBoardPrompt(){
   if(status) status.textContent=${JSON.stringify(locale === "zh" ? "prompt 已复制" : "Prompt copied")};
 }
 document.addEventListener("keydown",function(e){ if(e.key==="Escape"){ var modal=document.getElementById("plan-modal"); if(modal && !modal.hidden) closeBettingPlan(); } });
-["plan-bankroll","plan-loss","plan-provider","plan-base","plan-model","plan-key"].forEach(function(id){
+["plan-base","plan-model"].forEach(function(id){
+  var el=document.getElementById(id);
+  if(el){ el.addEventListener("input",function(){ el.dataset.userEdited="1"; }); }
+});
+var providerSelect=document.getElementById("plan-provider");
+if(providerSelect) providerSelect.addEventListener("change",syncPlanProviderDefaults);
+["plan-bankroll","plan-loss","plan-provider","plan-base","plan-model","plan-thinking","plan-key","plan-max-tokens"].forEach(function(id){
   var el=document.getElementById(id);
   if(el){ el.addEventListener("focus",function(){window.__pauseAutoRefresh=true;}); el.addEventListener("input",function(){window.__pauseAutoRefresh=true;}); }
 });
@@ -498,7 +873,7 @@ function aiBrief(locale: Locale, model = getMarketRadar()): string {
   );
 }
 
-function sidebar(locale: Locale, active: "home" | "opportunities" | "match" | "walrus"): string {
+function sidebar(locale: Locale, active: PageActive): string {
   const t = COPY[locale];
   const item = (key: keyof typeof t.sidebar, url: string, icon: string, isActive = false): string =>
     `<a class="${isActive ? "active" : ""}" href="${esc(url)}"><span>${icon}</span><b>${esc(t.sidebar[key])}</b></a>`;
@@ -508,6 +883,7 @@ function sidebar(locale: Locale, active: "home" | "opportunities" | "match" | "w
     `<nav class="side-nav">` +
     item("radar", href("/", locale), "⌘", active === "home") +
     item("opportunities", href("/opportunities", locale), "◇", active === "opportunities") +
+    item("review", href("/review", locale), "↺", active === "review") +
     item("walrus", href("/walrus", locale), "W", active === "walrus") +
     item("alerts", `${href("/", locale)}#alerts`, "◌") +
     item("api", "/api/radar", "↗") +
@@ -519,9 +895,9 @@ function sidebar(locale: Locale, active: "home" | "opportunities" | "match" | "w
 
 function topbar(
   locale: Locale,
-  active: "home" | "opportunities" | "match" | "walrus",
+  active: PageActive,
   model = getMarketRadar(),
-  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   const t = COPY[locale];
@@ -536,7 +912,7 @@ function topbar(
     `<input name="q" list="match-list" placeholder="${esc(t.search)}" autocomplete="off">` +
     `<input type="hidden" name="fk"><input type="hidden" name="lang" value="${locale}"><datalist id="match-list">${options}</datalist>` +
     `</form>` +
-    `<nav class="top-nav"><a class="${active === "home" ? "active" : ""}" href="${href("/", locale)}">${esc(t.home)}</a><a class="${active === "opportunities" ? "active" : ""}" href="${href("/opportunities", locale)}">${esc(t.opportunities)}</a><a class="${active === "walrus" ? "active" : ""}" href="${href("/walrus", locale)}">Walrus</a></nav>` +
+    `<nav class="top-nav"><a class="${active === "home" ? "active" : ""}" href="${href("/", locale)}">${esc(t.home)}</a><a class="${active === "opportunities" ? "active" : ""}" href="${href("/opportunities", locale)}">${esc(t.opportunities)}</a><a class="${active === "review" ? "active" : ""}" href="${href("/review", locale)}">${esc(t.sidebar.review)}</a><a class="${active === "walrus" ? "active" : ""}" href="${href("/walrus", locale)}">Walrus</a></nav>` +
     `<div class="top-actions">${freshnessChips(locale)}<a class="lang-pill" href="${href(switchPath, other, switchParams)}">${esc(LOCALE_NAME[other])}</a><a class="lang-pill" href="${active === "match" ? "#ai" : "#brief"}">${esc(t.aiBrief)}</a></div>` +
     `<script>
 function goMatchSearch(form){
@@ -553,12 +929,12 @@ function goMatchSearch(form){
 
 function page(
   locale: Locale,
-  active: "home" | "opportunities" | "match" | "walrus",
+  active: PageActive,
   title: string,
   body: string,
   model = getMarketRadar(),
   autoRefreshSec = 60,
-  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   return `<!doctype html>
@@ -587,22 +963,23 @@ a{color:inherit;text-decoration:none}
 .hero-title{font-size:34px;line-height:1.08;font-weight:820;margin:0 0 8px}.hero-sub{color:var(--dim);margin:0;max-width:820px}.mini{display:flex;gap:9px;align-items:center;flex-wrap:wrap;color:var(--dim);font-size:12px}.muted-line{margin-top:8px;color:var(--muted);font-size:12px}.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .metric-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin:14px 0}.metric-card{min-height:84px;padding:12px}.metric-card .label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}.metric-card .value{font-family:var(--mono);font-size:22px;line-height:1.2;margin-top:8px}.metric-card .hint{font-size:11px;color:var(--muted);margin-top:4px}
 .priority-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(330px,.7fr);gap:14px;margin-top:16px}.dayhead{margin:12px 0 8px;color:var(--dim);font-size:12px}.priority-list{display:grid;gap:10px}.priority-card{padding:11px}.sporttery-line{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim)}.brief-panel .brief-item{padding:10px 0}.brief-panel .brief-item:first-of-type{padding-top:0}.brief-panel .brief-tag{display:inline-block;margin-top:2px}.edge-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compact-table td,.compact-table th{padding:6px 8px}.details-panel{margin-top:10px}.btn{height:32px;border:1px solid var(--line);background:rgba(14,24,39,.72);color:var(--text);border-radius:8px;padding:0 12px;font-size:12px;cursor:pointer}.btn.primary{background:rgba(67,199,255,.22);border-color:var(--line2);color:#fff;font-weight:750}.btn:disabled{opacity:.55;cursor:wait}textarea.prompt-box,pre.prompt-box{width:100%;background:rgba(5,12,22,.72);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:12px/1.45 var(--mono);white-space:pre-wrap}textarea.prompt-box{min-height:150px;resize:vertical}pre.prompt-box{max-height:280px;overflow:auto}.analysis-card{margin-bottom:10px}.analysis-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.value-map{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:8px}.value-map div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}
-.plan-panel{margin-top:16px}.plan-card-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.plan-card-actions{display:grid;gap:8px;justify-items:end;min-width:150px}.plan-modal-backdrop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(2,8,16,.72);backdrop-filter:blur(14px)}.plan-modal-backdrop[hidden]{display:none}.plan-modal{width:min(1120px,100%);max-height:calc(100vh - 40px);overflow:hidden;border:1px solid var(--line2);border-radius:8px;background:linear-gradient(180deg,rgba(13,25,42,.98),rgba(6,14,25,.98));box-shadow:0 28px 90px rgba(0,0,0,.5)}.plan-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}.plan-modal-head h2{margin-top:0}.plan-modal-body{max-height:calc(100vh - 132px);overflow:auto;padding:14px 16px}.icon-btn{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(14,24,39,.72);color:var(--text);cursor:pointer;font-weight:800}.icon-btn:hover{border-color:var(--line2)}.plan-config{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:9px;margin-top:4px}.plan-config label{display:grid;gap:4px;color:var(--dim);font-size:11px}.plan-config input,.plan-config select{height:34px;min-width:0;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 9px}.plan-summary{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin:10px 0}.plan-summary div,.plan-empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.26);padding:10px}.plan-summary span{display:block;color:var(--dim);font-size:11px}.plan-summary b{display:block;font-family:var(--mono);font-size:18px;margin-top:3px}.plan-section{margin-top:10px}.plan-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.28fr);gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.plan-row:last-child{border-bottom:0}.plan-numbers{display:grid;gap:5px;align-content:start}.plan-numbers span{display:flex;justify-content:space-between;gap:8px;color:var(--dim);font-size:12px}.plan-numbers b{color:var(--text);font-family:var(--mono)}.plan-small{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
+.plan-panel{margin-top:16px}.plan-card-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.plan-card-actions{display:grid;gap:8px;justify-items:end;min-width:150px}.plan-modal-backdrop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(2,8,16,.72);backdrop-filter:blur(14px)}.plan-modal-backdrop[hidden]{display:none}.plan-modal{width:min(1120px,100%);max-height:calc(100vh - 40px);overflow:hidden;border:1px solid var(--line2);border-radius:8px;background:linear-gradient(180deg,rgba(13,25,42,.98),rgba(6,14,25,.98));box-shadow:0 28px 90px rgba(0,0,0,.5)}.plan-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}.plan-modal-head h2{margin-top:0}.plan-modal-body{max-height:calc(100vh - 132px);overflow:auto;padding:14px 16px}.icon-btn{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(14,24,39,.72);color:var(--text);cursor:pointer;font-weight:800}.icon-btn:hover{border-color:var(--line2)}.plan-config{display:grid;grid-template-columns:repeat(7,minmax(112px,1fr));gap:9px;margin-top:4px}.plan-config.compact-config{grid-template-columns:repeat(2,minmax(150px,1fr));margin:8px 0 0}.plan-config label{display:grid;gap:4px;color:var(--dim);font-size:11px}.plan-config input,.plan-config select{height:34px;min-width:0;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 9px}.switch-row{height:34px;display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.54);padding:0 9px;color:var(--text)}.switch-row input{width:15px;height:15px;padding:0}.plan-advanced{margin-top:8px}.plan-advanced summary{color:var(--dim);font-size:12px;cursor:pointer}.plan-progress{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid rgba(244,189,80,.28);background:rgba(244,189,80,.09);border-radius:8px;padding:10px 12px;margin:10px 0;color:var(--amber)}.plan-progress[hidden]{display:none}.plan-progress span{color:var(--dim);font-size:12px}.plan-verdict{border:1px solid rgba(154,230,110,.22);background:rgba(154,230,110,.08);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-weight:760}.plan-summary{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin:10px 0}.plan-summary div,.plan-empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.26);padding:10px}.plan-error pre{white-space:pre-wrap;margin:8px 0 0;color:var(--dim);font:12px/1.45 var(--mono)}.plan-summary span{display:block;color:var(--dim);font-size:11px}.plan-summary b{display:block;font-family:var(--mono);font-size:18px;margin-top:3px}.plan-section{margin-top:10px}.plan-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.28fr);gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.plan-row:last-child{border-bottom:0}.plan-bucket{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}.plan-bucket h3{margin:0 0 8px;font-size:14px}.plan-bucket.good h3{color:var(--lime)}.plan-bucket.watch h3{color:var(--amber)}.plan-bucket.avoid h3{color:var(--red)}.plan-bet-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(210px,.28fr);gap:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.22);margin-bottom:8px}.plan-lite-row{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:rgba(5,12,22,.18);margin-bottom:7px}.plan-lite-row p{margin:4px 0;color:var(--dim);font-size:12px}.plan-lite-row span{color:var(--muted);font-size:12px}.plan-numbers{display:grid;gap:5px;align-content:start}.plan-numbers span{display:flex;justify-content:space-between;gap:8px;color:var(--dim);font-size:12px}.plan-numbers b{color:var(--text);font-family:var(--mono)}.plan-small{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
 .section-head,.panel-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:22px 0 10px}.panel-head{margin:0 0 10px}h2{font-size:16px;margin:0}h2 small{color:var(--dim);font-weight:400;margin-left:8px}.section-head a{font-size:12px;color:var(--cyan)}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}.card-head{display:flex;align-items:center;gap:10px;margin-bottom:9px}.teams{font-weight:750;font-size:15px;flex:1}.ko{font-size:12px;color:var(--dim)}.live{color:#fff;background:rgba(231,102,117,.82);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:800}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}.card-head{display:flex;align-items:center;gap:10px;margin-bottom:9px}.teams{font-weight:750;font-size:15px;flex:1}.ko{font-size:12px;color:var(--dim)}.ko-stack{display:grid;gap:3px;min-width:86px}.ko-date{font-size:11px;color:var(--dim);white-space:nowrap}.count-pill{display:inline-flex;align-items:center;justify-content:center;min-height:20px;border:1px solid rgba(67,199,255,.24);border-radius:999px;padding:1px 7px;color:var(--cyan);background:rgba(67,199,255,.08);font:700 11px/1.2 var(--mono)}.live{color:#fff;background:rgba(231,102,117,.82);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:800}
 .prob-bar{display:flex;height:10px;overflow:hidden;border-radius:999px;background:rgba(149,174,205,.14);margin:8px 0}.prob-row{display:flex;gap:12px;color:var(--dim);font-size:12px;min-width:0}.prob-row b{color:var(--text)}.spark{margin-left:auto;min-width:0}.spark svg{display:block;max-width:100%;height:auto}
 .badge{display:inline-flex;align-items:center;min-height:19px;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:750;border:1px solid transparent;margin-right:4px}.badge.bad{background:rgba(231,102,117,.15);color:var(--red);border-color:rgba(231,102,117,.18)}.badge.watch{background:rgba(244,189,80,.12);color:var(--amber);border-color:rgba(244,189,80,.20)}.badge.low{background:rgba(154,230,110,.11);color:var(--lime);border-color:rgba(154,230,110,.18)}.badge.info{background:rgba(67,199,255,.11);color:var(--cyan);border-color:rgba(67,199,255,.18)}.badge.mute{background:rgba(149,174,205,.10);color:var(--dim);border-color:rgba(149,174,205,.16)}
 .score-ring{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:850;background:conic-gradient(var(--cyan) calc(var(--score)*1%),rgba(149,174,205,.14) 0);position:relative;flex:0 0 auto}.score-ring:before{content:"";position:absolute;inset:5px;border-radius:50%;background:var(--panel2)}.score-ring span{position:relative}
-.opp-row{display:grid;grid-template-columns:1.7fr .68fr .72fr .7fr .78fr .8fr .74fr .92fr;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}.opp-row:last-child{border-bottom:0}.opp-title{font-weight:760}.opp-note{font-size:12px;color:var(--dim);margin-top:4px}
+.source-diffs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0;color:var(--dim);font-size:11px}.source-diff{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:2px 6px;background:rgba(5,12,22,.22)}.source-diff b{color:var(--text);font-size:10px}.source-diff em{font-style:normal;font-family:var(--mono);font-size:10px}
+.opp-row{display:grid;grid-template-columns:1.7fr .68fr .72fr .7fr .78fr .8fr .74fr .92fr;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}.opp-row:last-child{border-bottom:0}.probability-row{grid-template-columns:1.9fr .58fr .58fr .58fr .62fr .62fr .56fr}.opp-title{font-weight:760}.opp-note{font-size:12px;color:var(--dim);margin-top:4px}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px 9px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:550;font-size:12px}td.num,th.num{text-align:right}.dim{color:var(--dim)}.pos{color:var(--lime)}.neg{color:var(--red)}
 .ai-brief{position:fixed;right:22px;bottom:20px;width:344px;z-index:30}.ai-brief summary{list-style:none;display:flex;gap:8px;align-items:center;border:1px solid var(--line2);background:rgba(12,24,43,.94);border-radius:999px;padding:10px 12px;box-shadow:0 18px 50px rgba(0,0,0,.30);cursor:pointer}.ai-brief summary::-webkit-details-marker{display:none}.spark-dot{width:9px;height:9px;border-radius:50%;background:var(--cyan);box-shadow:0 0 16px var(--cyan)}.brief-list{margin-top:10px;background:rgba(8,17,30,.96);border:1px solid var(--line);border-radius:8px;padding:8px;backdrop-filter:blur(18px)}.brief-item{padding:9px;border-bottom:1px solid var(--line);position:relative}.brief-item:last-child{border-bottom:0}.brief-item p{margin:4px 0;color:var(--dim);font-size:12px}.brief-tag{font-size:11px;color:var(--cyan)}
 .proof-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.proof-grid div{border:1px solid var(--line);border-radius:7px;padding:9px;background:rgba(5,12,22,.28)}.proof-grid span{display:block;color:var(--dim);font-size:11px}.proof-grid b{display:block;margin-top:4px;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis}.proof-blob{grid-column:1/-1}
-.match-hero{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding:18px;background:linear-gradient(135deg,rgba(67,199,255,.09),rgba(139,124,246,.09)),linear-gradient(180deg,rgba(15,28,47,.9),rgba(8,18,31,.86));border:1px solid var(--line);border-radius:8px}.team-badge{display:flex;align-items:center;gap:12px}.team-badge.away{justify-content:flex-end}.team-badge span{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:900;border:1px solid var(--line2);background:rgba(67,199,255,.10);color:var(--text)}.team-badge.away span{background:rgba(139,124,246,.12)}.team-badge b{font-size:20px}.countdown{text-align:center}.countdown strong{display:block;font-family:var(--mono);font-size:25px}.meta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:10px}.meta-grid div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}.meta-grid span{display:block;color:var(--dim);font-size:11px}.meta-grid b{display:block;margin-top:3px;font-size:12px}
+.match-hero{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding:18px;background:linear-gradient(135deg,rgba(67,199,255,.09),rgba(139,124,246,.09)),linear-gradient(180deg,rgba(15,28,47,.9),rgba(8,18,31,.86));border:1px solid var(--line);border-radius:8px}.team-badge{display:flex;align-items:center;gap:12px}.team-badge.away{justify-content:flex-end}.team-badge span{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:900;border:1px solid var(--line2);background:rgba(67,199,255,.10);color:var(--text)}.team-badge.away span{background:rgba(139,124,246,.12)}.team-badge b{font-size:20px}.countdown{text-align:center}.countdown strong{display:block;font-family:var(--mono);font-size:25px}.meta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:10px}.meta-grid div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}.meta-grid span{display:block;color:var(--dim);font-size:11px}.meta-grid b{display:block;margin-top:3px;font-size:12px}.review-scoreboard{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;border:1px solid var(--line2);border-radius:8px;background:rgba(67,199,255,.07);padding:12px;margin-bottom:10px}.review-scoreboard div{display:flex;align-items:baseline;gap:10px}.review-scoreboard div:last-child{justify-content:flex-end}.review-scoreboard span{color:var(--dim)}.review-scoreboard b{font:900 34px/1 var(--mono)}.review-scoreboard strong{color:var(--cyan);font-size:12px;text-align:center}.review-scoreboard.empty strong{max-width:520px;color:var(--dim);font-weight:550}.event-timeline{display:grid;gap:7px}.event-timeline.empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px;color:var(--dim)}.event-item{display:grid;grid-template-columns:58px 46px minmax(0,1fr);gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.18);padding:8px}.event-item.goal{border-color:rgba(244,189,80,.30);background:rgba(244,189,80,.07)}.event-item b{font-family:var(--mono);color:var(--amber)}.event-item p{margin:0;color:var(--dim);font-size:12px}
 .risk-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.risk-item{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);padding:10px}.risk-item .r-title{font-size:12px;color:var(--dim)}.risk-item .r-value{font-family:var(--mono);font-size:20px;margin:5px 0}
 .chart-grid{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:12px}.chart-cell{min-width:0;overflow:hidden}.chart-cell svg{display:block;width:100%;height:auto;max-width:100%}.chart-title{font-size:12px;color:var(--dim);margin-bottom:4px}.legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin:4px 0 10px;flex-wrap:wrap}.legend i{display:inline-block;width:14px;height:3px;margin-right:4px;vertical-align:middle}
 footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
 @media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid{grid-template-columns:minmax(0,1fr)}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.plan-config{grid-template-columns:repeat(3,minmax(0,1fr))}.plan-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.ai-brief{position:static;width:auto;margin-top:12px}.match-hero{grid-template-columns:1fr;text-align:left}.team-badge.away{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row{grid-template-columns:1fr}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-nav{overflow-x:auto;max-width:100%}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}}
+@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.ai-brief{position:static;width:auto;margin-top:12px}.match-hero,.review-scoreboard{grid-template-columns:1fr;text-align:left}.team-badge.away,.review-scoreboard div:last-child{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row,.plan-bet-card{grid-template-columns:1fr}.plan-progress{display:grid}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-nav{overflow-x:auto;max-width:100%}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}.event-item{grid-template-columns:50px 42px minmax(0,1fr)}}
 @media (max-width:520px){.metric-strip{grid-template-columns:1fr}.side-nav a b{display:none}.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}}
 </style>
 </head>
@@ -616,6 +993,26 @@ ${body}
 </div>
 <script>
 (function(){
+  function countdownText(el){
+    if(el.dataset.live==="1") return ${JSON.stringify(locale === "zh" ? "进行中" : "Live")};
+    var t=Date.parse(el.dataset.kickoff||"");
+    if(!Number.isFinite(t)) return el.textContent || "";
+    var diff=t-Date.now();
+    if(diff < -2.5*3600*1000) return ${JSON.stringify(locale === "zh" ? "已结束" : "Completed")};
+    if(diff <= 0) return ${JSON.stringify(locale === "zh" ? "进行中" : "Live")};
+    var minutes=Math.floor(diff/60000);
+    var days=Math.floor(minutes/1440);
+    var hours=Math.floor((minutes%1440)/60);
+    var mins=minutes%60;
+    if(days>0) return ${JSON.stringify(locale === "zh" ? "" : "")} + (days + ${JSON.stringify(locale === "zh" ? "天 " : "d ")} + hours + ${JSON.stringify(locale === "zh" ? "小时" : "h")});
+    if(hours>0) return hours + ${JSON.stringify(locale === "zh" ? "小时 " : "h ")} + mins + ${JSON.stringify(locale === "zh" ? "分" : "m")};
+    return Math.max(0, mins) + ${JSON.stringify(locale === "zh" ? "分" : "m")};
+  }
+  function updateCountdowns(){
+    document.querySelectorAll(".js-countdown").forEach(function(el){ el.textContent=countdownText(el); });
+  }
+  updateCountdowns();
+  setInterval(updateCountdowns, 1000);
   var y=sessionStorage.getItem("y"); if(y) window.scrollTo(0, Number(y));
   function typing(){
     var el=document.activeElement;
@@ -747,7 +1144,7 @@ function priorityMatchCard(locale: Locale, match: MatchIntelligence): string {
   const t = COPY[locale];
   const consensus = row.bookAvg ?? row.polymarket ?? row.kalshi ?? row.pinnacle;
   const kickoff = new Date(row.kickoffUtc);
-  const ko = row.live ? `<span class="live">${esc(t.labels.live)}</span>` : `<span class="ko">${esc(clock(locale, kickoff))}</span>`;
+  const ko = matchTimePill(locale, row, kickoff);
   const probRow = consensus
     ? `<div class="prob-row">${LABELS.map((label) => `<span>${esc(outcomeName(locale, row, label))} <b>${pct(consensus[label])}</b></span>`).join("")}<span class="spark">${cardSpark(locale, row)}</span></div>`
     : `<div class="dim">${esc(t.labels.insufficient)}</div>`;
@@ -755,10 +1152,45 @@ function priorityMatchCard(locale: Locale, match: MatchIntelligence): string {
     `<a class="card priority-card" href="${href("/match", locale, { fk: row.fixtureKey })}">` +
     `<div class="card-head">${ko}<span class="teams">${esc(matchNameFromRow(locale, row))}</span>${scoreRing(match.heatScore, "heat")}</div>` +
     (consensus ? consensusBar(locale, row, consensus) + probRow : probRow) +
-    sportteryDiffLine(locale, row) +
+    (sourceDiffStrip(locale, row) || sportteryDiffLine(locale, row)) +
     `<div class="mini"><span>PM liq <b class="mono">${compactMoney(match.pmLiquidity)}</b></span><span>24h traders <b class="mono">${compactNumber(match.pmActiveTraders24h)}</b>${match.sampled ? ` <span class="badge mute">${esc(t.labels.sampled)}</span>` : ""}</span><span>${esc(t.labels.gap)} <b class="mono">${match.maxDivergencePp.toFixed(1)}pp</b></span>${riskBadge(locale, match.riskLevel)}</div>` +
     `</a>`
   );
+}
+
+function matchTimePill(locale: Locale, row: CurrentOddsRow, kickoff: Date): string {
+  const live = row.live ? `<span class="live">${esc(COPY[locale].labels.live)}</span>` : "";
+  return (
+    `<span class="ko-stack">` +
+    `<span class="ko-date">${esc(dayLabel(locale, row.kickoffUtc))} ${esc(clock(locale, kickoff))}</span>` +
+    `<span class="count-pill js-countdown" data-kickoff="${esc(row.kickoffUtc)}" data-live="${row.live ? "1" : "0"}">${esc(countdown(locale, row))}</span>` +
+    live +
+    `</span>`
+  );
+}
+
+function sourceDiffStrip(locale: Locale, row: CurrentOddsRow): string {
+  if (!row.bookAvg) return "";
+  const sources: [string, string][] = [
+    ["pinnacle", "PIN"],
+    ["polymarket", "PM"],
+    ["kalshi", "KAL"],
+    ["sporttery", locale === "zh" ? "体彩" : "SPT"],
+  ];
+  const items = sources
+    .map(([source, label]) => {
+      const probs = row.sourceOdds[source];
+      if (!probs) return "";
+      const diffs = LABELS.map((outcome) => {
+        const diff = (probs[outcome] - row.bookAvg![outcome]) * 100;
+        const cls = Math.abs(diff) < 1 ? "dim" : diff > 0 ? "pos" : "neg";
+        return `<em class="${cls}">${esc(outcomeLabel(locale, outcome).slice(0, 1))}${signedPp(diff)}</em>`;
+      }).join("");
+      return `<span class="source-diff"><b>${esc(label)}</b>${diffs}</span>`;
+    })
+    .filter(Boolean)
+    .join("");
+  return items ? `<div class="source-diffs"><span class="dim">${locale === "zh" ? "相对书商中位" : "vs book median"}</span>${items}</div>` : "";
 }
 
 function priorityMatches(locale: Locale, matches: MatchIntelligence[]): string {
@@ -815,6 +1247,64 @@ function edgePanels(locale: Locale, rows: CurrentOddsRow[]): string {
     `<section class="span12"><div class="section-head"><h2>${locale === "zh" ? "体彩 vs 国际共识" : "Sporttery vs Market Consensus"}<small>${locale === "zh" ? `阈值 ${DIFF_PP}pp，书商 >=${MIN_BOOKS} 家` : `${DIFF_PP}pp threshold, ${MIN_BOOKS}+ books`}</small></h2></div>` +
     `<div class="edge-grid"><div class="panel"><div class="panel-head"><h2 style="color:var(--red)">${locale === "zh" ? "避坑" : "Avoid"}</h2></div>${edgeTable(locale, edges.avoid, locale === "zh" ? "当前没有显著偏高的方向。" : "No materially overpriced directions.")}</div>` +
     `<div class="panel"><div class="panel-head"><h2 style="color:var(--lime)">${locale === "zh" ? "相对划算" : "Relative Value"}</h2></div>${edgeTable(locale, edges.value, locale === "zh" ? "当前没有显著偏低的方向。" : "No materially underpriced directions.")}</div></div></section>`
+  );
+}
+
+function contributionText(locale: Locale, item: SourceContribution): string {
+  const label =
+    item.source === "book_median"
+      ? locale === "zh" ? "书商中位" : "book median"
+      : item.source === "polymarket"
+        ? "PM"
+        : item.source === "kalshi"
+          ? "Kalshi"
+          : "Pinnacle";
+  return `${label} ${pct(item.probability)} x ${(item.weight * 100).toFixed(0)}%`;
+}
+
+function probabilityModelPanel(locale: Locale, model: ReturnType<typeof getMarketRadar>, fixtureKey?: string): string {
+  const result = getProbabilityCandidates(70, fixtureKey);
+  const rowByFixture = new Map(model.matches.map((m) => [m.row.fixtureKey, m.row]));
+  const rows = result.candidates
+    .filter((candidate) => candidate.edgePp > 0 || candidate.expectedValuePct > 0)
+    .slice(0, fixtureKey ? 9 : 10);
+  const title = locale === "zh" ? "透明概率模型" : "Transparent Probability Model";
+  const sub = locale === "zh" ? "fair probability 不使用目标平台自身价格" : "fair probability excludes the target platform price";
+  const formula =
+    locale === "zh"
+      ? "Fair probability = 书商中位 0.50 x min(books/5,1) + Pinnacle 0.20 + PM 0.20 x confidence + Kalshi 0.10；体彩只作为可赔价格，不参与 fair probability。推荐分 = edge 45% + EV 25% + confidence 20% + source depth 10%。"
+      : "Fair probability = book median 0.50 x min(books/5,1) + Pinnacle 0.20 + PM 0.20 x confidence + Kalshi 0.10; Sporttery is treated only as an offered price. Score = edge 45% + EV 25% + confidence 20% + source depth 10%.";
+  if (!rows.length) {
+    return (
+      `<section class="span12"><div class="section-head"><h2>${title}<small>${sub}</small></h2></div>` +
+      `<div class="panel"><p class="dim">${locale === "zh" ? "当前没有足够独立来源支撑的正向 edge 候选。" : "No positive-edge candidate has enough independent sources right now."}</p>` +
+      `<details class="details-panel"><summary>${locale === "zh" ? "分数怎么算" : "How scores work"}</summary><p class="opp-note">${esc(formula)}</p></details></div></section>`
+    );
+  }
+  const body = rows
+    .map((candidate: ProbabilityCandidate) => {
+      const row = rowByFixture.get(candidate.fixtureKey);
+      const match = row ? matchNameFromRow(locale, row) : candidate.fixtureKey;
+      const outcome = row ? outcomeName(locale, row, candidate.outcome) : candidate.outcome.toUpperCase();
+      const contrib = candidate.sourceContributions.map((item) => contributionText(locale, item)).join(" · ");
+      return (
+        `<div class="opp-row probability-row">` +
+        `<div><div class="opp-title"><a href="${href("/match", locale, { fk: candidate.fixtureKey })}">${esc(match)}</a> · ${esc(outcome)}</div>` +
+        `<div class="opp-note">${esc(candidate.offeredOdd.platform)} @ ${candidate.offeredOdd.decimalOdds.toFixed(3)} · ${esc(candidate.offeredOdd.priceBasis)}</div>` +
+        `<div class="opp-note">${esc(contrib)}</div></div>` +
+        `<div class="num">${pct(candidate.fairProbability)}<div class="opp-note">fair</div></div>` +
+        `<div class="num">${pct(candidate.marketImpliedProbability)}<div class="opp-note">market</div></div>` +
+        `<div class="num ${candidate.edgePp >= 0 ? "pos" : "neg"}">${signedPp(candidate.edgePp)}pp<div class="opp-note">edge</div></div>` +
+        `<div class="num ${candidate.expectedValuePct >= 0 ? "pos" : "neg"}">${pct(candidate.expectedValuePct)}<div class="opp-note">EV/stake</div></div>` +
+        `<div class="num">${pct(candidate.kellyFraction)}<div class="opp-note">Kelly</div></div>` +
+        `<div style="display:flex;justify-content:flex-end">${scoreRing(candidate.score, "probability score")}</div>` +
+        `</div>`
+      );
+    })
+    .join("");
+  return (
+    `<section class="span12"><div class="section-head"><h2>${title}<small>${sub}</small></h2><a href="/api/probability${fixtureKey ? `?fk=${encodeURIComponent(fixtureKey)}` : ""}">JSON</a></div>` +
+    `<div class="panel">${body}<details class="details-panel"><summary>${locale === "zh" ? "分数怎么算" : "How scores work"}</summary><p class="opp-note">${esc(formula)}</p></details></div></section>`
   );
 }
 
@@ -929,6 +1419,7 @@ export function boardPage(locale: Locale = "zh"): string {
     metricStrip(locale, model) +
     `<div class="bento">` +
     edgePanels(locale, rows) +
+    probabilityModelPanel(locale, model) +
     `<section class="span8"><div class="section-head"><h2>${esc(t.sections.topOpps)}<small>${esc(t.sections.topOppsSub)}</small></h2><a href="${href("/opportunities", locale)}">${esc(t.sections.fullRanking)} →</a></div><div class="panel">${topOpps.map((o) => opportunityRow(locale, o)).join("")}</div></section>` +
     `<section class="span4"><div class="section-head"><h2>${esc(t.sections.highLiquidity)}</h2></div><div class="panel">${highLiquidity.map((o) => opportunityRow(locale, o, true)).join("") || `<p class="dim">${esc(t.empty.liquidity)}</p>`}</div></section>` +
     `<section class="span6"><div class="section-head"><h2>${esc(t.sections.divergence)}<small>${esc(t.sections.divergenceSub)}</small></h2></div>${compactOpportunityCards(locale, divergence, t.empty.divergence)}</section>` +
@@ -1078,6 +1569,42 @@ export function opportunitiesPage(locale: Locale = "zh"): string {
     walrusProof(locale) +
     `<footer>${esc(t.oppFooter)}</footer>`;
   return page(locale, "opportunities", `${t.opportunities} · WC Radar`, body, model);
+}
+
+function reviewMatchPanel(locale: Locale, row: CurrentOddsRow): string {
+  const history = reviewHistory(row);
+  const bundle = getMatchEventBundle(row.fixtureKey);
+  const markers = reviewGoalMarkers(locale, row, bundle);
+  const kickoff = new Date(row.kickoffUtc);
+  const title = matchNameFromRow(locale, row);
+  return (
+    `<section class="panel review-panel">` +
+    `<div class="panel-head"><h2><a href="${href("/match", locale, { fk: row.fixtureKey })}">${esc(title)}</a></h2><span class="badge ${bundle.result ? "low" : "mute"}">${bundle.result ? esc(resultStatusLabel(locale, bundle.result.status)) : locale === "zh" ? "已结束 inferred" : "Completed inferred"}</span></div>` +
+    reviewScoreboard(locale, row, bundle) +
+    `<div class="meta-grid review-meta"><div><span>${locale === "zh" ? "开赛" : "Kickoff"}</span><b>${esc(fullTime(locale, kickoff))} CST</b></div><div><span>${locale === "zh" ? "关键转折点" : "Key turn"}</span><b>${esc(reviewKeyTurn(locale, row, history, bundle))}</b></div><div><span>${locale === "zh" ? "PM 人话解释" : "PM plain read"}</span><b>${esc(reviewPmMove(locale, row, history, bundle))}</b></div><div><span>${locale === "zh" ? "进球时间轴" : "Goal timeline"}</span><b>${markers.length ? `${markers.length} ${locale === "zh" ? "个进球标记" : "goal markers"}` : locale === "zh" ? "暂无" : "None"}</b></div><div><span>${locale === "zh" ? "赛果来源" : "Result source"}</span><b>${esc(bundle.result?.source ?? (API_FOOTBALL_KEY ? "api_football pending" : "not configured"))}</b></div></div>` +
+    `<div style="margin-top:12px">${reviewTimeline(locale, row, bundle)}</div>` +
+    `<div style="margin-top:12px">${reviewTrendChart(locale, row, history, markers)}</div>` +
+    `<details class="details-panel"><summary>${locale === "zh" ? "全部来源异常跳变" : "All source jumps"}</summary><div style="margin-top:8px">${reviewAllJumps(locale, history)}</div></details>` +
+    `<details class="details-panel"><summary>${locale === "zh" ? "查看最新多源概率表" : "Latest multi-source probabilities"}</summary><div style="margin-top:8px">${sourceTable(locale, row)}</div></details>` +
+    `</section>`
+  );
+}
+
+export function reviewPage(locale: Locale = "zh"): string {
+  const model = getMarketRadar(70);
+  const rows = getCompletedOdds(24);
+  const resultNote = API_FOOTBALL_KEY
+    ? locale === "zh"
+      ? "已启用赛果事件源；匹配到的比赛会显示比分、进球时间轴，并把进球标到赔率走势图上。"
+      : "Result/event source is enabled; matched games show score, goal timeline, and goal markers on charts."
+    : locale === "zh"
+      ? "未配置 API_FOOTBALL_KEY 时，这里会清楚降级为赔率复盘；若 The Odds API scores 可用，则只补比分、不显示进球事件。"
+      : "Without API_FOOTBALL_KEY this clearly degrades to odds review. The Odds API scores fallback can add score only, not events.";
+  const body =
+    `<section class="panel" style="margin-top:16px"><div class="hero-title">${locale === "zh" ? "赛后赔率复盘" : "Post-match Odds Review"}</div><p class="hero-sub">${locale === "zh" ? "按开赛前 24 小时到开赛后 2.5 小时固定窗口复盘 PM、Kalshi、体彩和书商概率变化；优先用比分和进球时间解释市场转折。" : "Review PM, Kalshi, Sporttery, and book probability movement from 24h before kickoff to 2.5h after kickoff, with score and goal timing when available."}</p><div class="muted-line">${esc(resultNote)}</div></section>` +
+    `<section style="margin-top:14px;display:grid;gap:14px">${rows.length ? rows.map((row) => reviewMatchPanel(locale, row)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "还没有 inferred completed matches。" : "No inferred completed matches yet."}</p></div>`}</section>` +
+    `<footer>${esc(COPY[locale].footer)}</footer>`;
+  return page(locale, "review", `${locale === "zh" ? "赛后复盘" : "Post-match Review"} · WC Radar`, body, model, 300, "/review");
 }
 
 function countdown(locale: Locale, row: CurrentOddsRow): string {
@@ -1246,7 +1773,9 @@ export function matchPage(fixtureKey: string, locale: Locale = "zh"): string {
     `</section>` +
     bettingPlanPanel(locale, model, fixtureKey) +
     `<section class="bento">${aiAnalysisPanel(locale, fixtureKey, row, matchIntel)}<section class="span4 panel"><div class="panel-head"><h2>${esc(t.sections.riskPanel)}</h2></div>${matchIntel ? riskPanel(locale, matchIntel.riskSignals) : `<p class="dim">${esc(t.labels.insufficient)}</p>`}</section></section>` +
+    `<div class="bento">${matchEventsPanel(locale, row)}</div>` +
     `<div class="section-head"><h2>${esc(t.sections.sourceOdds)}</h2></div><div class="panel">${sourceTable(locale, row)}</div>` +
+    `<div class="bento">${probabilityModelPanel(locale, model, fixtureKey)}</div>` +
     `<div class="section-head"><h2>${esc(t.sections.related)}</h2></div>${related}` +
     `<div class="section-head"><h2>${esc(t.sections.priceTrend)}</h2></div><div class="panel">${trendChart(locale, fixtureKey)}</div>` +
     walrusProof(locale) +

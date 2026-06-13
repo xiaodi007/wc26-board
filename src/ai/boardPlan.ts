@@ -4,6 +4,7 @@ import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay 
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getMarketRadar, formatThreeWayShort, type MatchIntelligence } from "../queries/marketIntelligence.js";
 import { getOfferedOddsForFixtures, resolveOfferedOdd, type OfferedOdd } from "../queries/offeredOdds.js";
+import { getProbabilityCandidates } from "../queries/probabilityModel.js";
 import { getSportteryEdges } from "../queries/sportteryAvoidance.js";
 import { zhTeamName } from "../teams.js";
 import { callProvider, type AiProviderOverride } from "./analyze.js";
@@ -225,6 +226,15 @@ export function buildBoardBettingContext(fixtureKey?: string | null, locale: Boa
   const offeredOdds = getOfferedOddsForFixtures(rows.map((row) => row.fixtureKey));
   const matchMap = new Map(radar.matches.map((match) => [match.row.fixtureKey, match]));
   const edges = getSportteryEdges(rows, { thresholdPp: 2, minBooks: 5 });
+  const probabilityCandidates = getProbabilityCandidates(70, fixtureKey)
+    .candidates.filter((candidate) => rows.some((row) => row.fixtureKey === candidate.fixtureKey))
+    .slice(0, 12);
+  const probabilityLine = probabilityCandidates
+    .map(
+      (c) =>
+        `${c.fixtureKey} ${c.outcome} ${c.offeredOdd.platform} fair=${pct(c.fairProbability)} market=${pct(c.marketImpliedProbability)} edge=${pp(c.edgePp)} EV=${pct(c.expectedValuePct)} score=${Math.round(c.score)}`
+    )
+    .join("\n");
   const freshness = getSourceFreshness().map((f) => `${freshnessGroup(locale, f.group)}=${fmtAge(f.ageMs)}`).join(" · ");
   const health = runHealthChecks().counts;
   const alerts = listRecentAlerts(6).map((a) => `${a.kind}: ${a.title}`).join(" ; ") || "-";
@@ -243,6 +253,7 @@ export function buildBoardBettingContext(fixtureKey?: string | null, locale: Boa
       `# 资金模型提示\n系统后续会用 25% Kelly、本金 1% 单注上限和用户输入的最大日亏损上限计算金额;你只输出概率、方向和理由。`,
       `# 数据状态\nfreshness: ${freshness}\nhealth: pass=${health.pass} warn=${health.warn} fail=${health.fail}\nrecent_alerts: ${alerts}`,
       `# 体彩相对信号\n相对划算: ${edges.value.slice(0, 8).map((e) => `${e.match} ${e.outcome} ${pp(e.diffPp)}`).join("; ") || "-"}\n避坑: ${edges.avoid.slice(0, 8).map((e) => `${e.match} ${e.outcome} ${pp(e.diffPp)}`).join("; ") || "-"}`,
+      `# 系统透明概率候选\n${probabilityLine || "无足够独立来源支撑的候选"}`,
       `# 当前比赛\n${rows.map((row) => matchLine(locale, row, matchMap.get(row.fixtureKey), offeredOdds)).join("\n\n") || "无可用比赛"}`,
       `# Top 市场机会(系统评分)\n${radar.opportunities.slice(0, 12).map((o) => `${o.fixtureKey} ${o.outcome} ${o.platform} score=${Math.round(o.opportunityScore)} confidence=${Math.round(o.confidenceScore)} risk=${o.riskLevel} gap=${o.maxCrossPlatformProbabilityGap.toFixed(1)}pp consensus=${formatThreeWayShort(radar.matches.find((m) => m.row.fixtureKey === o.fixtureKey)?.row.bookAvg ?? null)}`).join("\n")}`,
     ].join("\n\n");
@@ -255,6 +266,7 @@ export function buildBoardBettingContext(fixtureKey?: string | null, locale: Boa
     `# Bankroll model note\nThe system will calculate amounts later using 25% Kelly, a 1% bankroll max stake per pick, and the user's max daily loss cap. You only output probability, direction, and rationale.`,
     `# Data status\nfreshness: ${freshness}\nhealth: pass=${health.pass} warn=${health.warn} fail=${health.fail}\nrecent_alerts: ${alerts}`,
     `# Sporttery relative signals\nrelative value: ${edges.value.slice(0, 8).map((e) => `${e.match} ${e.outcome} ${pp(e.diffPp)}`).join("; ") || "-"}\navoid: ${edges.avoid.slice(0, 8).map((e) => `${e.match} ${e.outcome} ${pp(e.diffPp)}`).join("; ") || "-"}`,
+    `# System transparent probability candidates\n${probabilityLine || "No candidate has enough independent source support."}`,
     `# Current matches\n${rows.map((row) => matchLine(locale, row, matchMap.get(row.fixtureKey), offeredOdds)).join("\n\n") || "No available matches"}`,
     `# Top market opportunities (system score)\n${radar.opportunities.slice(0, 12).map((o) => `${o.fixtureKey} ${o.outcome} ${o.platform} score=${Math.round(o.opportunityScore)} confidence=${Math.round(o.confidenceScore)} risk=${o.riskLevel} gap=${o.maxCrossPlatformProbabilityGap.toFixed(1)}pp consensus=${formatThreeWayShort(radar.matches.find((m) => m.row.fixtureKey === o.fixtureKey)?.row.bookAvg ?? null)}`).join("\n")}`,
   ].join("\n\n");

@@ -32,6 +32,7 @@ export const COPY = {
     sidebar: {
       radar: "世界杯雷达",
       opportunities: "市场机会",
+      review: "赛后复盘",
       calendar: "比赛日历",
       platforms: "平台总览",
       watchlist: "我的关注",
@@ -159,6 +160,7 @@ export const COPY = {
     sidebar: {
       radar: "World Cup Radar",
       opportunities: "Market Opportunities",
+      review: "Post-match Review",
       calendar: "Match Calendar",
       platforms: "Platform Overview",
       watchlist: "Watchlist",

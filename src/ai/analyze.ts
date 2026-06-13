@@ -149,6 +149,7 @@ interface AiProvider {
   thinking?: string;
   thinkingModel?: string;
   reasoningEffort?: string;
+  maxTokens?: string;
 }
 
 export interface AiProviderOverride {
@@ -158,6 +159,7 @@ export interface AiProviderOverride {
   model?: string;
   thinking?: string;
   temperature?: string;
+  maxTokens?: string;
 }
 
 export interface CurrentAiProvider {
@@ -168,6 +170,16 @@ export interface CurrentAiProvider {
   requiredKeyName: string;
   keyReady: boolean;
   missingConfig: string | null;
+}
+
+export interface AiProviderOption {
+  id: AiProviderId;
+  label: string;
+  baseUrl: string;
+  modelHint: string;
+  thinkingSupported: boolean;
+  defaultThinking: ThinkingMode;
+  thinkingModelHint?: string;
 }
 
 interface ProviderResult {
@@ -205,6 +217,7 @@ function withOverride(provider: AiProvider, override?: AiProviderOverride): AiPr
     model: typeof override.model === "string" && override.model.trim() ? override.model.trim() : provider.model,
     thinking: typeof override.thinking === "string" && override.thinking.trim() ? override.thinking.trim() : provider.thinking,
     temperature: typeof override.temperature === "string" && override.temperature.trim() ? override.temperature.trim() : provider.temperature,
+    maxTokens: typeof override.maxTokens === "string" && override.maxTokens.trim() ? override.maxTokens.trim() : provider.maxTokens,
   };
 }
 
@@ -309,6 +322,49 @@ function parseThinking(value: string | undefined): ThinkingMode {
   return "disabled";
 }
 
+function parseMaxTokens(value: string | undefined): number | null {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, 128_000) : null;
+}
+
+export function aiProviderOptions(): AiProviderOption[] {
+  return [
+    {
+      id: "anthropic",
+      label: "Anthropic",
+      baseUrl: ANTHROPIC_BASE,
+      modelHint: ANTHROPIC_MODEL,
+      thinkingSupported: false,
+      defaultThinking: "disabled",
+    },
+    {
+      id: "deepseek",
+      label: "DeepSeek",
+      baseUrl: DEEPSEEK_BASE,
+      modelHint: DEEPSEEK_MODEL,
+      thinkingSupported: true,
+      defaultThinking: parseThinking(DEEPSEEK_THINKING),
+      thinkingModelHint: DEEPSEEK_THINKING_MODEL,
+    },
+    {
+      id: "kimi",
+      label: "Kimi",
+      baseUrl: KIMI_BASE,
+      modelHint: KIMI_MODEL,
+      thinkingSupported: true,
+      defaultThinking: parseThinking(KIMI_THINKING),
+    },
+    {
+      id: "openai-compatible",
+      label: "OpenAI-compatible",
+      baseUrl: "",
+      modelHint: "",
+      thinkingSupported: false,
+      defaultThinking: "disabled",
+    },
+  ];
+}
+
 function openAiModel(provider: AiProvider, thinking: ThinkingMode): string {
   if (provider.id === "deepseek" && thinking === "enabled") return provider.thinkingModel || provider.model;
   return provider.model;
@@ -373,7 +429,7 @@ async function withRetries<T>(fn: () => Promise<T>): Promise<T> {
 async function callAnthropic(provider: AiProvider, system: string, userPrompt: string): Promise<ProviderResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
-    max_tokens: AI_MAX_TOKENS,
+    max_tokens: parseMaxTokens(provider.maxTokens) ?? AI_MAX_TOKENS,
     system,
     messages: [{ role: "user", content: userPrompt }],
     output_config: { format: { type: "json_schema", schema: ANALYSIS_SCHEMA } },
@@ -435,9 +491,10 @@ async function callOpenAiCompatible(provider: AiProvider, system: string, userPr
       { role: "system", content: jsonContract(system) },
       { role: "user", content: userPrompt },
     ],
-    max_tokens: AI_MAX_TOKENS,
     response_format: { type: "json_object" },
   };
+  const maxTokens = parseMaxTokens(provider.maxTokens);
+  if (maxTokens !== null) body.max_tokens = maxTokens;
 
   if (provider.temperature && !(provider.id === "deepseek" && thinking === "enabled")) {
     body.temperature = Number(provider.temperature);
@@ -474,7 +531,7 @@ async function callOpenAiCompatible(provider: AiProvider, system: string, userPr
     const reasoningChars = typeof message?.reasoning_content === "string" ? message.reasoning_content.length : 0;
     if (!content.trim() && reasoningChars > 0) {
       throw new Error(
-        `${provider.label} returned reasoning_content (${reasoningChars} chars) but no final content. Increase AI_MAX_TOKENS or turn provider thinking off.`
+        `${provider.label} returned reasoning_content (${reasoningChars} chars) but no final content. Turn provider thinking off or set a larger advanced max tokens value.`
       );
     }
     if (!content.trim()) throw new Error(`${provider.label}: empty response`);

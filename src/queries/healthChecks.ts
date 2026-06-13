@@ -1,4 +1,4 @@
-import { KALSHI_POLL_MS, ODDS_API_KEY, ODDSAPI_POLL_MS, PM_POLL_MS } from "../config.js";
+import { KALSHI_POLL_MS, ODDS_API_KEY, ODDSAPI_POLL_MS, PM_POLL_MS, SPORTTERY_POLL_MS } from "../config.js";
 import { db, getMeta } from "../db.js";
 import { fixtureTeamDayKey, isSameFixtureWindow } from "../fixtures.js";
 
@@ -19,7 +19,7 @@ export interface HealthReport {
 const PM_MATCH_TYPES = "('home_win_binary','draw_binary','away_win_binary')";
 const PM_STALE_MS = Math.max(PM_POLL_MS * 3, 15 * 60 * 1000);
 const KALSHI_STALE_MS = Math.max(KALSHI_POLL_MS * 3, 15 * 60 * 1000);
-const SPORTTERY_STALE_MS = 24 * 60 * 60 * 1000;
+const SPORTTERY_STALE_MS = Math.max(SPORTTERY_POLL_MS * 2, 2 * 60 * 60 * 1000);
 
 function one<T>(sql: string): T {
   return db.prepare(sql).get() as T;
@@ -203,7 +203,7 @@ export function runHealthChecks(): HealthReport {
   const sportteryLast = getMeta("sporttery_last_call");
   const sportteryAge = ageMs(sportteryLast);
   if (!sportteryLast || sportteryAge === null) {
-    add("warn", "sporttery has not been fetched yet; this is manual-low-frequency by design");
+    add("warn", "sporttery has not been fetched yet; daemon should poll it hourly");
   } else if (sportteryAge > SPORTTERY_STALE_MS) {
     add("warn", `sporttery last fetch is stale: latest=${sportteryLast} age=${fmtAge(sportteryAge)}`);
   } else {
