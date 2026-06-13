@@ -2,8 +2,10 @@
 // HTML 服务端渲染 + /api/* JSON(读层纯函数复用,与 CLI 同源)。
 // 唯一的"写"入口是 AI 分析(结果落 ai_analysis 表)与 prompt 模板(meta 表)。
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { BOARD_PORT, BOARD_PORT_EXPLICIT, log } from "./config.js";
-import { boardPage, matchPage, opportunitiesPage } from "./board/render.js";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { BOARD_PORT, BOARD_PORT_EXPLICIT, log, WALRUS_FEED_DIR } from "./config.js";
+import { boardPage, matchPage, opportunitiesPage, walrusPage } from "./board/render.js";
 import { parseLocale } from "./board/i18n.js";
 import { getCurrentOdds } from "./queries/currentOdds.js";
 import { getSportteryEdges } from "./queries/sportteryAvoidance.js";
@@ -11,8 +13,10 @@ import { getOutrightBoard } from "./queries/outright.js";
 import { runHealthChecks } from "./queries/healthChecks.js";
 import { getLineHistory } from "./queries/lineHistory.js";
 import { getMarketRadar } from "./queries/marketIntelligence.js";
-import { analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey } from "./ai/analyze.js";
-import { listAnalyses, setMeta, db } from "./db.js";
+import { analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey, type AiProviderOverride } from "./ai/analyze.js";
+import { analyzeBoardBettingPlan, boardPlanSystemPrompt, buildBoardBettingContext, latestBoardVerdict, planConstants, type BoardPromptLocale } from "./ai/boardPlan.js";
+import { listAnalyses, listWalrusPublishLog, setMeta, db, getMeta } from "./db.js";
+import { getOfferedOddsForFixtures } from "./queries/offeredOdds.js";
 
 function html(res: ServerResponse, body: string): void {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -46,6 +50,42 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
+function str(body: Record<string, unknown>, name: string): string | undefined {
+  const value = body[name];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function providerOverride(body: Record<string, unknown>): AiProviderOverride {
+  return {
+    provider: str(body, "provider"),
+    apiKey: str(body, "apiKey"),
+    baseUrl: str(body, "baseUrl"),
+    model: str(body, "model"),
+    thinking: str(body, "thinking"),
+    temperature: str(body, "temperature"),
+  };
+}
+
+function moneyParam(body: Record<string, unknown>, name: string): number {
+  const raw = body[name];
+  const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function boardPromptLocale(url: URL): BoardPromptLocale {
+  return url.searchParams.get("lang") === "zh" ? "zh" : "en";
+}
+
+function walrusManifest(): unknown {
+  const path = join(WALRUS_FEED_DIR, "manifest-latest.json");
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const locale = parseLocale(url.searchParams.get("lang"));
@@ -55,6 +95,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return html(res, boardPage(locale));
     case "/opportunities":
       return html(res, opportunitiesPage(locale));
+    case "/walrus":
+      return html(res, walrusPage(locale));
     case "/match": {
       const fk = url.searchParams.get("fk");
       if (!fk) return notFound(res);
@@ -70,6 +112,31 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return json(res, getOutrightBoard(intParam(url, "limit", 10, 64)));
     case "/api/health":
       return json(res, runHealthChecks());
+    case "/api/walrus":
+      return json(res, {
+        latest: {
+          manifestBlobId: getMeta("walrus_latest_manifest_blob_id"),
+          manifestObjectId: getMeta("walrus_latest_manifest_object_id"),
+          publishedAt: getMeta("walrus_latest_published_at"),
+          network: getMeta("walrus_latest_network"),
+          schemaVersion: getMeta("walrus_latest_schema_version"),
+          error: getMeta("walrus_latest_error"),
+          artifactCount: getMeta("walrus_latest_artifact_count"),
+          totalBytes: getMeta("walrus_latest_total_bytes"),
+        },
+        manifest: walrusManifest(),
+        logs: listWalrusPublishLog(20),
+      });
+    case "/api/ai/providers":
+      return json(res, {
+        current: currentAiProvider(),
+        providers: [
+          { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com", modelHint: "claude-sonnet-4-6" },
+          { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", modelHint: "deepseek-v4-flash" },
+          { id: "kimi", label: "Kimi", baseUrl: "https://api.moonshot.cn/v1", modelHint: "kimi-k2.6" },
+          { id: "openai-compatible", label: "OpenAI-compatible", baseUrl: "", modelHint: "" },
+        ],
+      });
     case "/api/history": {
       const fk = url.searchParams.get("fk");
       if (!fk) return notFound(res);
@@ -85,8 +152,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (req.method !== "POST") return notFound(res);
       const fk = url.searchParams.get("fk");
       if (!fk) return json(res, { error: "missing fk" }, 400);
-      if (!hasApiKey()) {
-        const provider = currentAiProvider();
+      const body = await readJsonBody(req);
+      const override = providerOverride(body);
+      if (!hasApiKey(override)) {
+        const provider = currentAiProvider(override);
         const missing = provider.missingConfig ?? provider.requiredKeyName;
         const message =
           locale === "zh"
@@ -94,8 +163,44 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
             : `${missing} is not configured. Copy the prompt instead.`;
         return json(res, { error: "no_api_key", message }, 503);
       }
-      const outcome = await analyzeMatch(fk);
+      const outcome = await analyzeMatch(fk, override);
       return json(res, { id: outcome.id, model: outcome.model, verdict: outcome.verdict, raw: outcome.raw });
+    }
+    case "/api/analyze-board": {
+      if (req.method !== "POST") return notFound(res);
+      const body = await readJsonBody(req);
+      const override = providerOverride(body);
+      if (!hasApiKey(override)) {
+        const provider = currentAiProvider(override);
+        const missing = provider.missingConfig ?? provider.requiredKeyName;
+        const message =
+          locale === "zh"
+            ? `${missing} 未配置,请用复制 prompt 的方式`
+            : `${missing} is not configured. Copy the prompt instead.`;
+        return json(res, { error: "no_api_key", message }, 503);
+      }
+      const bankroll = moneyParam(body, "bankroll");
+      const maxDailyLoss = moneyParam(body, "maxDailyLoss");
+      if (!bankroll || !maxDailyLoss) return json(res, { error: "missing_bankroll", message: "bankroll and maxDailyLoss are required" }, 400);
+      const outcome = await analyzeBoardBettingPlan({
+        fixtureKey: str(body, "fixtureKey") ?? url.searchParams.get("fk"),
+        bankroll,
+        maxDailyLoss,
+        override,
+        locale: boardPromptLocale(url),
+      });
+      return json(res, { id: outcome.id, model: outcome.model, verdict: outcome.verdict, plan: outcome.plan, constants: planConstants() });
+    }
+    case "/api/board-prompt": {
+      const fk = url.searchParams.get("fk");
+      const promptLocale = boardPromptLocale(url);
+      return json(res, { system: boardPlanSystemPrompt(promptLocale), context: buildBoardBettingContext(fk, promptLocale) });
+    }
+    case "/api/board-plan/latest": {
+      const latest = latestBoardVerdict();
+      if (!latest?.verdict) return json(res, { latest: null, constants: planConstants() });
+      const fixtureKeys = [...new Set(latest.verdict.recommendations.map((pick) => pick.fixture_key))];
+      return json(res, { latest, offeredOdds: getOfferedOddsForFixtures(fixtureKeys), constants: planConstants() });
     }
     case "/api/analyses": {
       const fk = url.searchParams.get("fk");

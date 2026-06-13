@@ -15,7 +15,8 @@
     "import:sporttery": "tsx src/importSporttery.ts",
     "fetch:sporttery": "tsx src/fetchSporttery.ts",
     "export:walrus": "tsx src/exportWalrus.ts",
-    "publish:walrus:testnet": "WALRUS_ENABLED=true WALRUS_NETWORK=testnet tsx src/publishWalrus.ts"
+    "publish:walrus:testnet": "WALRUS_ENABLED=true WALRUS_NETWORK=testnet tsx src/publishWalrus.ts",
+    "publish:walrus:testnet:compact": "WALRUS_ENABLED=true WALRUS_NETWORK=testnet tsx src/publishWalrus.ts --compact"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",

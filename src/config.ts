@@ -55,6 +55,7 @@ export const WALRUS_ENABLED = (process.env.WALRUS_ENABLED || "false").toLowerCas
 export const WALRUS_NETWORK = process.env.WALRUS_NETWORK || "testnet";
 export const WALRUS_EPOCHS = Number(process.env.WALRUS_EPOCHS || 3);
 export const WALRUS_PUBLISHER_URL = process.env.WALRUS_PUBLISHER_URL || "";
+export const WALRUS_AGGREGATOR_URL = process.env.WALRUS_AGGREGATOR_URL || "";
 export const WALRUS_FEED_DIR = isAbsolute(walrusFeedDirRaw) ? walrusFeedDirRaw : join(ROOT, walrusFeedDirRaw);
 
 // AI 分析面板。无 key 时面板降级为 prompt 预览 + 复制(粘贴到任意 AI 用)

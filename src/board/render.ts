@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { WALRUS_AGGREGATOR_URL, WALRUS_FEED_DIR } from "../config.js";
 import { getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "../queries/currentOdds.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
 import { getSportteryEdges, type SportteryAvoidanceRow } from "../queries/sportteryAvoidance.js";
@@ -19,7 +22,8 @@ import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthCh
 import { getAllSportteryHhad, getSportteryHhad, type HhadBoardRow } from "../queries/hhad.js";
 import { buildMatchContext } from "../ai/context.js";
 import { currentAiProvider, currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
-import { countAlerts24h, getMeta, listAnalyses, listRecentAlerts, type AiAnalysisRow } from "../db.js";
+import { latestBoardVerdict, type BoardBettingVerdict } from "../ai/boardPlan.js";
+import { countAlerts24h, getMeta, listAnalyses, listRecentAlerts, listWalrusPublishLog, type AiAnalysisRow } from "../db.js";
 import { normalizeTeam, zhTeamName } from "../teams.js";
 import { lineChart, sparkline, type ChartSeries } from "./svg.js";
 import {
@@ -284,6 +288,183 @@ function walrusProof(locale: Locale): string {
   );
 }
 
+function money(v: number | null | undefined, digits = 2): string {
+  return v === null || v === undefined || !Number.isFinite(v) ? "-" : v.toLocaleString("en-US", { maximumFractionDigits: digits });
+}
+
+function latestBettingSummary(locale: Locale, verdict: BoardBettingVerdict | null): string {
+  if (!verdict) {
+    return `<div class="plan-empty">${locale === "zh" ? "还没有生成投注计划。填入本金、最大日亏损和临时 API key 后，可以直接生成；也可以先复制 prompt 到外部 AI。" : "No betting plan yet. Add bankroll, max daily loss, and a temporary API key, or copy the prompt."}</div>`;
+  }
+  const picks = verdict.recommendations
+    .slice(0, 3)
+    .map((pick) => `<span class="chip ok">${esc(pick.outcome.toUpperCase())} <b>${pct(pick.estimated_probability)}</b></span>`)
+    .join("");
+  return (
+    `<p class="hero-sub">${esc(verdict.summary_zh)}</p>` +
+    `<div class="mini" style="margin-top:8px">${picks || `<span class="chip">${locale === "zh" ? "暂无正 EV 建议" : "No positive-EV picks"}</span>`}</div>` +
+    `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
+    `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`
+  );
+}
+
+function latestBettingCardSummary(locale: Locale, verdict: BoardBettingVerdict | null): string {
+  if (!verdict) {
+    return (
+      `<p class="hero-sub">${locale === "zh" ? "还没有生成投注计划。打开弹窗后可以生成，或先复制 prompt 到外部 AI。" : "No betting plan yet. Open the dialog to generate one, or copy the prompt for an external AI."}</p>` +
+      `<div class="mini" style="margin-top:8px"><span class="chip">${locale === "zh" ? "未生成" : "Not generated"}</span></div>`
+    );
+  }
+  const picks = verdict.recommendations.length;
+  return (
+    `<p class="hero-sub">${esc(verdict.summary_zh || (locale === "zh" ? "已有计划，打开查看详情。" : "A plan is available. Open it for details."))}</p>` +
+    `<div class="mini" style="margin-top:8px"><span class="chip ok">${locale === "zh" ? "推荐" : "Picks"} <b>${picks}</b></span><span class="chip">${locale === "zh" ? "观察" : "Watch"} <b>${verdict.watchlist.length}</b></span><span class="chip">${locale === "zh" ? "避开" : "Avoid"} <b>${verdict.avoid.length}</b></span></div>` +
+    `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
+    `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`
+  );
+}
+
+function bettingPlanPanel(locale: Locale, model: ReturnType<typeof getMarketRadar>, fixtureKey?: string): string {
+  const latest = latestBoardVerdict();
+  const latestVerdict = latest?.verdict ?? null;
+  const provider = currentAiProvider();
+  const title = fixtureKey ? (locale === "zh" ? "本场投注计划" : "Match Betting Plan") : (locale === "zh" ? "AI 投注计划" : "AI Betting Plan");
+  const hint = locale === "zh"
+    ? "金额只在浏览器本次计算使用，不保存。默认 25% Kelly、单注最多 1% 本金，并受最大日亏损限制。"
+    : "Amounts are used only for this browser request. Defaults: 25% Kelly, 1% max stake per pick, capped by max daily loss.";
+  const matchNames = Object.fromEntries(model.matches.map((m) => [m.row.fixtureKey, matchNameFromRow(locale, m.row)]));
+  const providerOptions = [
+    ["anthropic", "Anthropic"],
+    ["deepseek", "DeepSeek"],
+    ["kimi", "Kimi"],
+    ["openai-compatible", "OpenAI-compatible"],
+  ]
+    .map(([id, label]) => `<option value="${id}"${provider.id === id ? " selected" : ""}>${label}</option>`)
+    .join("");
+  return (
+    `<section class="panel plan-panel plan-card" id="betting-plan">` +
+    `<div class="panel-head"><h2>${esc(title)}</h2><span class="badge info">${locale === "zh" ? "25% Kelly 模拟" : "25% Kelly simulation"}</span></div>` +
+    `<div class="plan-card-grid"><div id="plan-card-copy">${latestBettingCardSummary(locale, latestVerdict)}</div><div class="plan-card-actions"><button id="plan-open" type="button" class="btn primary" onclick="openBettingPlan()">${locale === "zh" ? "打开计划" : "Open plan"}</button><button type="button" class="btn" onclick="copyBoardPrompt()">${locale === "zh" ? "复制 prompt" : "Copy prompt"}</button><span id="plan-status" class="dim"></span></div></div>` +
+    `</section>` +
+    `<div class="plan-modal-backdrop" id="plan-modal" hidden onclick="if(event.target===this) closeBettingPlan()">` +
+    `<section class="plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">` +
+    `<div class="plan-modal-head"><div><h2 id="plan-modal-title">${esc(title)}</h2><p class="opp-note">${esc(hint)}</p></div><button type="button" class="icon-btn" aria-label="${locale === "zh" ? "关闭" : "Close"}" onclick="closeBettingPlan()">x</button></div>` +
+    `<div class="plan-modal-body">` +
+    `<div class="plan-config" data-fixture="${esc(fixtureKey ?? "")}">` +
+    `<label>${locale === "zh" ? "本金" : "Bankroll"}<input id="plan-bankroll" type="number" min="1" step="1" placeholder="10000" autocomplete="off"></label>` +
+    `<label>${locale === "zh" ? "最大日亏损" : "Max daily loss"}<input id="plan-loss" type="number" min="1" step="1" placeholder="300" autocomplete="off"></label>` +
+    `<label>Provider<select id="plan-provider">${providerOptions}</select></label>` +
+    `<label>Base URL<input id="plan-base" value="${esc(provider.baseUrl)}" placeholder="https://api.example.com/v1" autocomplete="off"></label>` +
+    `<label>Model<input id="plan-model" value="${esc(provider.model === "(未配置)" ? "" : provider.model)}" placeholder="model" autocomplete="off"></label>` +
+    `<label>API key<input id="plan-key" type="password" placeholder="${esc(provider.requiredKeyName)}" autocomplete="off"></label>` +
+    `</div>` +
+    `<div class="mini" style="margin:10px 0"><button id="plan-go" type="button" class="btn primary" onclick="generateBettingPlan()">${fixtureKey ? (locale === "zh" ? "按当前本金生成本场计划" : "Generate match plan") : (locale === "zh" ? "生成投注计划" : "Generate betting plan")}</button><button type="button" class="btn" onclick="copyBoardPrompt()">${locale === "zh" ? "复制完整 prompt" : "Copy full prompt"}</button></div>` +
+    `<div id="plan-output">${latestBettingSummary(locale, latestVerdict)}</div>` +
+    `</div>` +
+    `</section>` +
+    `</div>` +
+    `<script>
+window.__matchNames=${JSON.stringify(matchNames)};
+window.__planFixture=${JSON.stringify(fixtureKey ?? "")};
+function planMoney(v){ return Number.isFinite(v) ? v.toLocaleString(undefined,{maximumFractionDigits:2}) : "-"; }
+function planPct(v){ return Number.isFinite(v) ? (v*100).toFixed(1)+"%" : "-"; }
+function planOutcome(row){ return (row.outcome||"").toUpperCase(); }
+function h(v){ return String(v==null?"":v).replace(/[&<>"]/g,function(c){ if(c==="&") return "&amp;"; if(c==="<") return "&lt;"; if(c===">") return "&gt;"; return "&quot;"; }); }
+function explicitPlanLang(){
+  var lang=new URLSearchParams(location.search).get("lang");
+  return lang==="zh" || lang==="en" ? lang : "";
+}
+function planApiUrl(path){
+  var params=new URLSearchParams();
+  var lang=explicitPlanLang();
+  if(lang) params.set("lang", lang);
+  return path + (params.toString() ? "?" + params.toString() : "");
+}
+function planPromptUrl(){
+  var params=new URLSearchParams();
+  if(window.__planFixture) params.set("fk", window.__planFixture);
+  var lang=explicitPlanLang();
+  if(lang) params.set("lang", lang);
+  return "/api/board-prompt" + (params.toString() ? "?" + params.toString() : "");
+}
+function openBettingPlan(){
+  var modal=document.getElementById("plan-modal");
+  if(!modal) return;
+  modal.hidden=false;
+  document.body.classList.add("modal-open");
+  window.__pauseAutoRefresh=true;
+  setTimeout(function(){ var el=document.getElementById("plan-bankroll") || document.getElementById("plan-go"); if(el) el.focus(); }, 0);
+}
+function closeBettingPlan(){
+  var modal=document.getElementById("plan-modal");
+  if(modal) modal.hidden=true;
+  ["plan-bankroll","plan-loss","plan-key"].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=""; });
+  document.body.classList.remove("modal-open");
+  window.__pauseAutoRefresh=false;
+  var open=document.getElementById("plan-open"); if(open) open.focus();
+}
+function planInputs(){
+  return {
+    fixtureKey: window.__planFixture || undefined,
+    bankroll: Number(document.getElementById("plan-bankroll").value),
+    maxDailyLoss: Number(document.getElementById("plan-loss").value),
+    provider: document.getElementById("plan-provider").value,
+    baseUrl: document.getElementById("plan-base").value,
+    model: document.getElementById("plan-model").value,
+    apiKey: document.getElementById("plan-key").value
+  };
+}
+function renderPlan(data){
+  var out=document.getElementById("plan-output");
+  if(!data || !data.plan || !data.verdict){ out.innerHTML="<div class='plan-empty'>${locale === "zh" ? "AI 没有返回可解析计划。" : "AI did not return a parsable plan."}</div>"; return; }
+  var s=data.plan.summary;
+  var bets=data.plan.rows.filter(function(r){return r.bucket==="bet" && r.stake>0;});
+  var watch=(data.verdict.watchlist||[]).slice(0,6);
+  var avoid=(data.verdict.avoid||[]).slice(0,6);
+  var summary="<div class='plan-summary'><div><span>${locale === "zh" ? "总下注" : "Total stake"}</span><b>"+planMoney(s.totalStake)+"</b></div><div><span>${locale === "zh" ? "最坏亏损" : "Worst loss"}</span><b>"+planMoney(s.worstCaseLoss)+"</b></div><div><span>${locale === "zh" ? "全中净收益" : "All-win profit"}</span><b>"+planMoney(s.allWinNetProfit)+"</b></div><div><span>${locale === "zh" ? "期望收益" : "Expected value"}</span><b>"+planMoney(s.expectedValue)+"</b></div><div><span>${locale === "zh" ? "预计亏损概率" : "Approx. loss prob."}</span><b>"+(s.approximateLossProbability===null?"-":planPct(s.approximateLossProbability))+"</b></div></div>";
+  var betHtml=bets.length ? bets.map(function(r){
+    var match=window.__matchNames[r.fixture_key] || r.fixture_key;
+    return "<div class='plan-row'><div><b>"+h(match)+" · "+h(planOutcome(r))+"</b><div class='opp-note'>"+h(r.offeredOdd.platform)+" @ "+r.offeredOdd.decimalOdds.toFixed(3)+" · AI "+planPct(r.estimated_probability)+" · market "+planPct(r.marketImpliedProbability)+" · edge "+r.edgePp.toFixed(1)+"pp</div><p class='opp-note'>"+h(r.reason)+"</p><div class='muted-line'>${locale === "zh" ? "撤销条件" : "Cancel if"}: "+h(r.cancel_if)+"</div><div class='muted-line'>${locale === "zh" ? "风险" : "Risk"}: "+h(r.risk)+"</div></div><div class='plan-numbers'><span>${locale === "zh" ? "下注" : "Stake"} <b>"+planMoney(r.stake)+"</b></span><span>${locale === "zh" ? "胜则净赚" : "Profit if win"} <b>"+planMoney(r.netProfitIfWin)+"</b></span><span>${locale === "zh" ? "亏损上限" : "Max loss"} <b>"+planMoney(r.maxLoss)+"</b></span><span>EV <b>"+planMoney(r.expectedValue)+"</b></span></div></div>";
+  }).join("") : "<div class='plan-empty'>${locale === "zh" ? "当前没有达到正 EV + 2pp 门槛的下注建议。" : "No pick cleared the positive-EV + 2pp threshold."}</div>";
+  function smallRows(rows,label){
+    return "<div class='plan-small'><div class='opp-title'>"+h(label)+"</div>"+(rows.length?rows.map(function(r){var match=window.__matchNames[r.fixture_key]||r.fixture_key; return "<div class='muted-line'><b>"+h(match)+" · "+h(planOutcome(r))+"</b> "+h(r.take||r.trigger||"")+" <span class='dim'>"+h(r.risk||"")+"</span></div>";}).join(""):"<div class='muted-line'>-</div>")+"</div>";
+  }
+  out.innerHTML="<p class='hero-sub'>"+h(data.verdict.summary_zh)+"</p>"+summary+"<div class='plan-section'><div class='opp-title'>${locale === "zh" ? "建议下注" : "Recommended bets"}</div>"+betHtml+"</div>"+smallRows(watch,"${locale === "zh" ? "谨慎观察" : "Watchlist"}")+smallRows(avoid,"${locale === "zh" ? "不下注 / 避坑" : "No bet / avoid"}")+"<div class='muted-line'>${locale === "zh" ? "组合概率按独立事件近似,实际比赛之间可能相关。" : "Portfolio probabilities assume independence; real matches may be correlated."}</div>";
+  var card=document.getElementById("plan-card-copy");
+  if(card){
+    card.innerHTML="<p class='hero-sub'>"+h(data.verdict.summary_zh)+"</p><div class='mini' style='margin-top:8px'><span class='chip ok'>${locale === "zh" ? "推荐" : "Picks"} <b>"+(data.verdict.recommendations||[]).length+"</b></span><span class='chip'>${locale === "zh" ? "观察" : "Watch"} <b>"+watch.length+"</b></span><span class='chip'>${locale === "zh" ? "避开" : "Avoid"} <b>"+avoid.length+"</b></span></div><div class='muted-line'>${locale === "zh" ? "资金纪律" : "Bankroll"}: "+h(data.verdict.bankroll_note||"-")+"</div><div class='muted-line'>${locale === "zh" ? "数据质量" : "Data quality"}: "+h(data.verdict.data_quality||"-")+"</div>";
+  }
+}
+async function generateBettingPlan(){
+  window.__busy=true;
+  var status=document.getElementById("plan-status"); if(status) status.textContent=${JSON.stringify(locale === "zh" ? "生成中..." : "Generating...")};
+  try{
+    var body=planInputs();
+    var res=await fetch(planApiUrl("/api/analyze-board"),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    var data=await res.json();
+    if(!res.ok) throw new Error(data.message||data.error||res.status);
+    renderPlan(data);
+    if(status) status.textContent=${JSON.stringify(locale === "zh" ? "完成" : "Done")};
+  }catch(e){ if(status) status.textContent=(${JSON.stringify(locale === "zh" ? "失败: " : "Failed: ")})+e.message; }
+  finally{ window.__busy=false; }
+}
+async function copyBoardPrompt(){
+  var status=document.getElementById("plan-status");
+  var res=await fetch(planPromptUrl());
+  var data=await res.json();
+  var text=data.system+"\\n\\n---\\n\\n"+data.context.prompt;
+  await navigator.clipboard.writeText(text);
+  if(status) status.textContent=${JSON.stringify(locale === "zh" ? "prompt 已复制" : "Prompt copied")};
+}
+document.addEventListener("keydown",function(e){ if(e.key==="Escape"){ var modal=document.getElementById("plan-modal"); if(modal && !modal.hidden) closeBettingPlan(); } });
+["plan-bankroll","plan-loss","plan-provider","plan-base","plan-model","plan-key"].forEach(function(id){
+  var el=document.getElementById(id);
+  if(el){ el.addEventListener("focus",function(){window.__pauseAutoRefresh=true;}); el.addEventListener("input",function(){window.__pauseAutoRefresh=true;}); }
+});
+</script>`
+  );
+}
+
 function metricStrip(locale: Locale, model = getMarketRadar()): string {
   const t = COPY[locale];
   const m = model.metrics;
@@ -317,7 +498,7 @@ function aiBrief(locale: Locale, model = getMarketRadar()): string {
   );
 }
 
-function sidebar(locale: Locale, active: "home" | "opportunities" | "match"): string {
+function sidebar(locale: Locale, active: "home" | "opportunities" | "match" | "walrus"): string {
   const t = COPY[locale];
   const item = (key: keyof typeof t.sidebar, url: string, icon: string, isActive = false): string =>
     `<a class="${isActive ? "active" : ""}" href="${esc(url)}"><span>${icon}</span><b>${esc(t.sidebar[key])}</b></a>`;
@@ -327,6 +508,7 @@ function sidebar(locale: Locale, active: "home" | "opportunities" | "match"): st
     `<nav class="side-nav">` +
     item("radar", href("/", locale), "⌘", active === "home") +
     item("opportunities", href("/opportunities", locale), "◇", active === "opportunities") +
+    item("walrus", href("/walrus", locale), "W", active === "walrus") +
     item("alerts", `${href("/", locale)}#alerts`, "◌") +
     item("api", "/api/radar", "↗") +
     `</nav>` +
@@ -337,9 +519,9 @@ function sidebar(locale: Locale, active: "home" | "opportunities" | "match"): st
 
 function topbar(
   locale: Locale,
-  active: "home" | "opportunities" | "match",
+  active: "home" | "opportunities" | "match" | "walrus",
   model = getMarketRadar(),
-  switchPath = active === "opportunities" ? "/opportunities" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   const t = COPY[locale];
@@ -354,7 +536,7 @@ function topbar(
     `<input name="q" list="match-list" placeholder="${esc(t.search)}" autocomplete="off">` +
     `<input type="hidden" name="fk"><input type="hidden" name="lang" value="${locale}"><datalist id="match-list">${options}</datalist>` +
     `</form>` +
-    `<nav class="top-nav"><a class="${active === "home" ? "active" : ""}" href="${href("/", locale)}">${esc(t.home)}</a><a class="${active === "opportunities" ? "active" : ""}" href="${href("/opportunities", locale)}">${esc(t.opportunities)}</a></nav>` +
+    `<nav class="top-nav"><a class="${active === "home" ? "active" : ""}" href="${href("/", locale)}">${esc(t.home)}</a><a class="${active === "opportunities" ? "active" : ""}" href="${href("/opportunities", locale)}">${esc(t.opportunities)}</a><a class="${active === "walrus" ? "active" : ""}" href="${href("/walrus", locale)}">Walrus</a></nav>` +
     `<div class="top-actions">${freshnessChips(locale)}<a class="lang-pill" href="${href(switchPath, other, switchParams)}">${esc(LOCALE_NAME[other])}</a><a class="lang-pill" href="${active === "match" ? "#ai" : "#brief"}">${esc(t.aiBrief)}</a></div>` +
     `<script>
 function goMatchSearch(form){
@@ -371,12 +553,12 @@ function goMatchSearch(form){
 
 function page(
   locale: Locale,
-  active: "home" | "opportunities" | "match",
+  active: "home" | "opportunities" | "match" | "walrus",
   title: string,
   body: string,
   model = getMarketRadar(),
   autoRefreshSec = 60,
-  switchPath = active === "opportunities" ? "/opportunities" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   return `<!doctype html>
@@ -389,6 +571,7 @@ function page(
 :root{--bg:#06111f;--bg2:#081827;--panel:rgba(13,25,42,.82);--panel2:rgba(10,19,32,.94);--line:rgba(149,174,205,.18);--line2:rgba(67,199,255,.34);--text:#eef6ff;--dim:#91a4bc;--muted:#607188;--cyan:#43c7ff;--violet:#8b7cf6;--lime:#9ae66e;--amber:#f4bd50;--red:#e76675;--mono:"SFMono-Regular","Roboto Mono","Cascadia Mono",monospace}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;overflow-x:hidden;background:radial-gradient(circle at 70% 0%,rgba(67,199,255,.10),transparent 34%),linear-gradient(180deg,#06111f 0%,#071523 48%,#060b13 100%);color:var(--text);font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;letter-spacing:0}
+body.modal-open{overflow:hidden}
 a{color:inherit;text-decoration:none}
 .shell{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
 .sidebar{position:sticky;top:0;height:100vh;border-right:1px solid var(--line);background:rgba(4,12,22,.82);backdrop-filter:blur(18px);padding:16px 12px;display:flex;flex-direction:column;gap:18px}
@@ -404,6 +587,7 @@ a{color:inherit;text-decoration:none}
 .hero-title{font-size:34px;line-height:1.08;font-weight:820;margin:0 0 8px}.hero-sub{color:var(--dim);margin:0;max-width:820px}.mini{display:flex;gap:9px;align-items:center;flex-wrap:wrap;color:var(--dim);font-size:12px}.muted-line{margin-top:8px;color:var(--muted);font-size:12px}.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .metric-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin:14px 0}.metric-card{min-height:84px;padding:12px}.metric-card .label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}.metric-card .value{font-family:var(--mono);font-size:22px;line-height:1.2;margin-top:8px}.metric-card .hint{font-size:11px;color:var(--muted);margin-top:4px}
 .priority-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(330px,.7fr);gap:14px;margin-top:16px}.dayhead{margin:12px 0 8px;color:var(--dim);font-size:12px}.priority-list{display:grid;gap:10px}.priority-card{padding:11px}.sporttery-line{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim)}.brief-panel .brief-item{padding:10px 0}.brief-panel .brief-item:first-of-type{padding-top:0}.brief-panel .brief-tag{display:inline-block;margin-top:2px}.edge-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compact-table td,.compact-table th{padding:6px 8px}.details-panel{margin-top:10px}.btn{height:32px;border:1px solid var(--line);background:rgba(14,24,39,.72);color:var(--text);border-radius:8px;padding:0 12px;font-size:12px;cursor:pointer}.btn.primary{background:rgba(67,199,255,.22);border-color:var(--line2);color:#fff;font-weight:750}.btn:disabled{opacity:.55;cursor:wait}textarea.prompt-box,pre.prompt-box{width:100%;background:rgba(5,12,22,.72);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:12px/1.45 var(--mono);white-space:pre-wrap}textarea.prompt-box{min-height:150px;resize:vertical}pre.prompt-box{max-height:280px;overflow:auto}.analysis-card{margin-bottom:10px}.analysis-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.value-map{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:8px}.value-map div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}
+.plan-panel{margin-top:16px}.plan-card-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.plan-card-actions{display:grid;gap:8px;justify-items:end;min-width:150px}.plan-modal-backdrop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(2,8,16,.72);backdrop-filter:blur(14px)}.plan-modal-backdrop[hidden]{display:none}.plan-modal{width:min(1120px,100%);max-height:calc(100vh - 40px);overflow:hidden;border:1px solid var(--line2);border-radius:8px;background:linear-gradient(180deg,rgba(13,25,42,.98),rgba(6,14,25,.98));box-shadow:0 28px 90px rgba(0,0,0,.5)}.plan-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}.plan-modal-head h2{margin-top:0}.plan-modal-body{max-height:calc(100vh - 132px);overflow:auto;padding:14px 16px}.icon-btn{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(14,24,39,.72);color:var(--text);cursor:pointer;font-weight:800}.icon-btn:hover{border-color:var(--line2)}.plan-config{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:9px;margin-top:4px}.plan-config label{display:grid;gap:4px;color:var(--dim);font-size:11px}.plan-config input,.plan-config select{height:34px;min-width:0;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 9px}.plan-summary{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin:10px 0}.plan-summary div,.plan-empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.26);padding:10px}.plan-summary span{display:block;color:var(--dim);font-size:11px}.plan-summary b{display:block;font-family:var(--mono);font-size:18px;margin-top:3px}.plan-section{margin-top:10px}.plan-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.28fr);gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.plan-row:last-child{border-bottom:0}.plan-numbers{display:grid;gap:5px;align-content:start}.plan-numbers span{display:flex;justify-content:space-between;gap:8px;color:var(--dim);font-size:12px}.plan-numbers b{color:var(--text);font-family:var(--mono)}.plan-small{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
 .section-head,.panel-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:22px 0 10px}.panel-head{margin:0 0 10px}h2{font-size:16px;margin:0}h2 small{color:var(--dim);font-weight:400;margin-left:8px}.section-head a{font-size:12px;color:var(--cyan)}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}.card-head{display:flex;align-items:center;gap:10px;margin-bottom:9px}.teams{font-weight:750;font-size:15px;flex:1}.ko{font-size:12px;color:var(--dim)}.live{color:#fff;background:rgba(231,102,117,.82);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:800}
 .prob-bar{display:flex;height:10px;overflow:hidden;border-radius:999px;background:rgba(149,174,205,.14);margin:8px 0}.prob-row{display:flex;gap:12px;color:var(--dim);font-size:12px;min-width:0}.prob-row b{color:var(--text)}.spark{margin-left:auto;min-width:0}.spark svg{display:block;max-width:100%;height:auto}
@@ -417,8 +601,8 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;p
 .risk-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.risk-item{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);padding:10px}.risk-item .r-title{font-size:12px;color:var(--dim)}.risk-item .r-value{font-family:var(--mono);font-size:20px;margin:5px 0}
 .chart-grid{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:12px}.chart-cell{min-width:0;overflow:hidden}.chart-cell svg{display:block;width:100%;height:auto;max-width:100%}.chart-title{font-size:12px;color:var(--dim);margin-bottom:4px}.legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin:4px 0 10px;flex-wrap:wrap}.legend i{display:inline-block;width:14px;height:3px;margin-right:4px;vertical-align:middle}
 footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
-@media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid{grid-template-columns:minmax(0,1fr)}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.ai-brief{position:static;width:auto;margin-top:12px}.match-hero{grid-template-columns:1fr;text-align:left}.team-badge.away{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map{grid-template-columns:1fr}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-nav{overflow-x:auto;max-width:100%}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}}
+@media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid{grid-template-columns:minmax(0,1fr)}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.plan-config{grid-template-columns:repeat(3,minmax(0,1fr))}.plan-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.ai-brief{position:static;width:auto;margin-top:12px}.match-hero{grid-template-columns:1fr;text-align:left}.team-badge.away{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row{grid-template-columns:1fr}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-nav{overflow-x:auto;max-width:100%}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}}
 @media (max-width:520px){.metric-strip{grid-template-columns:1fr}.side-nav a b{display:none}.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}}
 </style>
 </head>
@@ -433,7 +617,17 @@ ${body}
 <script>
 (function(){
   var y=sessionStorage.getItem("y"); if(y) window.scrollTo(0, Number(y));
-  setTimeout(function(){ sessionStorage.setItem("y", String(window.scrollY)); location.reload(); }, ${autoRefreshSec * 1000});
+  function typing(){
+    var el=document.activeElement;
+    return el && ["INPUT","TEXTAREA","SELECT"].indexOf(el.tagName)>=0;
+  }
+  function schedule(){
+    setTimeout(function(){
+      if(window.__busy || window.__pauseAutoRefresh || typing()){ schedule(); return; }
+      sessionStorage.setItem("y", String(window.scrollY)); location.reload();
+    }, ${autoRefreshSec * 1000});
+  }
+  schedule();
 })();
 </script>
 </body>
@@ -730,6 +924,7 @@ export function boardPage(locale: Locale = "zh"): string {
   const topOpps = model.opportunities.slice(0, 5);
   const alerts = countAlerts24h();
   const body =
+    bettingPlanPanel(locale, model) +
     `<section class="priority-grid"><div class="panel"><div class="panel-head"><h2>${locale === "zh" ? "近期重点比赛" : "Priority Matches"}</h2><div class="mini">${alerts ? `<a class="chip stale" href="#alerts">Alerts <b>${alerts}</b></a>` : ""}<span class="chip">Sampled PM <b>${model.metrics.sampledMarkets}</b></span><span class="chip">${esc(t.metrics.opportunities)} <b>${model.metrics.aiOpportunityCount}</b></span></div></div>${priorityMatches(locale, model.matches)}</div>${briefPanel(locale, model, rows)}</section>` +
     metricStrip(locale, model) +
     `<div class="bento">` +
@@ -745,6 +940,132 @@ export function boardPage(locale: Locale = "zh"): string {
     `<section class="span12">${walrusProof(locale)}</section>` +
     `</div><footer>${esc(t.footer)}</footer>`;
   return page(locale, "home", t.heroTitle, body, model);
+}
+
+function readWalrusManifest(): Record<string, unknown> | null {
+  const path = join(WALRUS_FEED_DIR, "manifest-latest.json");
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function readWalrusJson(relativePath: string): Record<string, unknown> | null {
+  const path = join(WALRUS_FEED_DIR, relativePath);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function walrusBlobHref(blobId: string): string | null {
+  const base = WALRUS_AGGREGATOR_URL.trim().replace(/\/+$/, "");
+  return base ? `${base}/v1/blobs/${encodeURIComponent(blobId)}` : null;
+}
+
+function walrusManifestHref(): string | null {
+  const blob = getMeta("walrus_latest_manifest_blob_id");
+  return blob ? walrusBlobHref(blob) : null;
+}
+
+function walrusArtifactsTable(locale: Locale, manifest: Record<string, unknown> | null): string {
+  const artifacts = Array.isArray(manifest?.artifacts) ? (manifest.artifacts as Record<string, unknown>[]) : [];
+  if (!artifacts.length) return `<p class="dim">${locale === "zh" ? "本地 manifest 尚未生成。" : "No local manifest yet."}</p>`;
+  const rows = artifacts
+    .map((artifact) => {
+      const walrus = artifact.walrus && typeof artifact.walrus === "object" ? (artifact.walrus as Record<string, unknown>) : {};
+      const blob = typeof walrus.blob_id === "string" ? walrus.blob_id : "";
+      const hrefBlob = blob ? walrusBlobHref(blob) : null;
+      return (
+        `<tr><td>${esc(String(artifact.relativePath ?? artifact.name ?? "-"))}</td>` +
+        `<td class="num">${money(Number(artifact.bytes ?? 0), 0)}</td>` +
+        `<td class="mono">${esc(String(artifact.sha256 ?? "-")).slice(0, 18)}</td>` +
+        `<td class="mono">${hrefBlob ? `<a href="${esc(hrefBlob)}">${esc(blob.slice(0, 18))}</a>` : esc(blob ? blob.slice(0, 18) : "-")}</td>` +
+        `<td>${hrefBlob ? `<a class="btn" href="${esc(hrefBlob)}">${locale === "zh" ? "打开数据" : "Open data"}</a>` : `<span class="dim">${locale === "zh" ? "未发布" : "Not published"}</span>`}</td></tr>`
+      );
+    })
+    .join("");
+  return `<table class="compact-table"><tr><th>Artifact</th><th class="num">Bytes</th><th>SHA-256</th><th>Blob</th><th>${locale === "zh" ? "动作" : "Action"}</th></tr>${rows}</table>`;
+}
+
+function walrusDataPreview(locale: Locale): string {
+  const radar = readWalrusJson("radar-latest.json");
+  const opportunitiesFile = readWalrusJson("opportunities-latest.json");
+  const ai = readWalrusJson("ai-board-latest.json");
+  if (!radar && !opportunitiesFile && !ai) {
+    return `<p class="dim">${locale === "zh" ? "还没有本地 Walrus 数据预览。先运行 npm run export:walrus 或发布一次快照。" : "No local Walrus data preview yet. Run npm run export:walrus or publish a snapshot first."}</p>`;
+  }
+
+  const metrics = radar?.metrics && typeof radar.metrics === "object" ? (radar.metrics as Record<string, unknown>) : {};
+  const metricCards = [
+    [locale === "zh" ? "总市场" : "Total markets", compactNumber(Number(metrics.totalMarkets ?? 0))],
+    ["PM liquidity", compactMoney(typeof metrics.pmLiquidity === "number" ? metrics.pmLiquidity : null)],
+    ["24h volume", compactMoney(typeof metrics.pmVolume24h === "number" ? metrics.pmVolume24h : null)],
+    [locale === "zh" ? "AI 机会" : "AI opportunities", compactNumber(Number(metrics.aiOpportunityCount ?? 0))],
+    ["Sampled", compactNumber(Number(metrics.sampledMarkets ?? 0))],
+  ]
+    .map(([label, value]) => `<div><span>${esc(label)}</span><b>${esc(value)}</b></div>`)
+    .join("");
+
+  const opportunities = Array.isArray(opportunitiesFile?.opportunities)
+    ? (opportunitiesFile!.opportunities as Record<string, unknown>[])
+    : Array.isArray(radar?.opportunities)
+      ? (radar!.opportunities as Record<string, unknown>[])
+      : [];
+  const opportunityRows = opportunities.slice(0, 6).map((row) => {
+    const match = String(row.match ?? `${row.home_team ?? "-"} vs ${row.away_team ?? "-"}`);
+    const score = Number(row.opportunity_score ?? 0);
+    return (
+      `<tr><td>${esc(match)}</td><td>${esc(String(row.outcome ?? "-"))}</td><td>${esc(String(row.platform ?? "-"))}</td>` +
+      `<td class="num">${Number.isFinite(score) ? Math.round(score) : "-"}</td><td>${esc(String(row.risk_level ?? "-"))}</td></tr>`
+    );
+  }).join("");
+
+  const latestAnalysis = ai?.latest_analysis && typeof ai.latest_analysis === "object" ? (ai.latest_analysis as Record<string, unknown>) : null;
+  const verdict = latestAnalysis?.verdict && typeof latestAnalysis.verdict === "object" ? (latestAnalysis.verdict as BoardBettingVerdict) : null;
+  const digest = verdict
+    ? latestBettingSummary(locale, verdict)
+    : `<p class="dim">${locale === "zh" ? "Walrus AI digest 尚未生成。" : "Walrus AI digest has not been generated yet."}</p>`;
+
+  return (
+    `<div class="proof-grid">${metricCards}</div>` +
+    `<div class="section-head"><h2>${locale === "zh" ? "Top 机会数据" : "Top opportunity data"}</h2></div>` +
+    (opportunityRows ? `<table class="compact-table"><tr><th>Match</th><th>Outcome</th><th>Platform</th><th class="num">Score</th><th>Risk</th></tr>${opportunityRows}</table>` : `<p class="dim">${locale === "zh" ? "暂无机会数据。" : "No opportunity data yet."}</p>`) +
+    `<div class="section-head"><h2>${locale === "zh" ? "AI 公共摘要" : "Public AI digest"}</h2></div>${digest}`
+  );
+}
+
+function walrusLogPanel(locale: Locale): string {
+  const logs = listWalrusPublishLog(12);
+  if (!logs.length) return `<p class="dim">${locale === "zh" ? "还没有 Walrus 发布日志。" : "No Walrus publish logs yet."}</p>`;
+  return `<table class="compact-table"><tr><th>${locale === "zh" ? "时间" : "Time"}</th><th>Status</th><th>Network</th><th class="num">Artifacts</th><th class="num">Bytes</th><th>Detail</th></tr>${logs
+    .map((log) => {
+      const cls = log.status === "success" ? "low" : "watch";
+      return `<tr><td>${esc(fullTime(locale, new Date(`${log.ts}Z`)))}</td><td><span class="badge ${cls}">${esc(log.status)}</span></td><td>${esc(log.network ?? "-")}</td><td class="num">${log.artifact_count}</td><td class="num">${money(log.total_bytes, 0)}</td><td>${esc(log.detail ?? log.manifest_blob_id ?? "-")}</td></tr>`;
+    })
+    .join("")}</table>`;
+}
+
+export function walrusPage(locale: Locale = "zh"): string {
+  const model = getMarketRadar(70);
+  const manifest = readWalrusManifest();
+  const generated = typeof manifest?.generated_at === "string" ? manifest.generated_at : getMeta("walrus_latest_published_at");
+  const manifestHref = walrusManifestHref();
+  const latest = latestBoardVerdict();
+  const body =
+    `<section class="panel" style="margin-top:16px"><div class="hero-title">Walrus Data</div><p class="hero-sub">${locale === "zh" ? "公开、可验证的市场快照。这里展示 latest manifest、artifact、blob、AI 公共摘要和发布日志；用户本金、下注金额、API key 不会进入 Walrus。" : "Public verifiable market snapshots. This page shows the latest manifest, artifacts, blobs, public AI summary, and publish logs; user bankroll, stake amounts, and API keys are not exported."}</p></section>` +
+    `<section style="margin-top:14px">${walrusProof(locale)}</section>` +
+    `<div class="bento" style="margin-top:14px">` +
+    `<section class="span8 panel"><div class="panel-head"><h2>Manifest</h2><div class="mini"><span class="badge info">${esc(String(manifest?.schema_version ?? getMeta("walrus_latest_schema_version") ?? "-"))}</span>${manifestHref ? `<a class="btn" href="${esc(manifestHref)}">${locale === "zh" ? "打开 manifest JSON" : "Open manifest JSON"}</a>` : ""}<a class="btn" href="/api/walrus">${locale === "zh" ? "打开 /api/walrus" : "Open /api/walrus"}</a></div></div><div class="proof-grid"><div><span>${locale === "zh" ? "生成时间" : "Generated"}</span><b>${generated ? esc(fullTime(locale, new Date(generated))) : "-"}</b></div><div><span>Network</span><b>${esc(String(manifest?.network ?? getMeta("walrus_latest_network") ?? "testnet"))}</b></div><div><span>Artifacts</span><b>${Array.isArray(manifest?.artifacts) ? manifest.artifacts.length : getMeta("walrus_latest_artifact_count") ?? "-"}</b></div></div><div style="margin-top:12px">${walrusArtifactsTable(locale, manifest)}</div></section>` +
+    `<section class="span4 panel"><div class="panel-head"><h2>${locale === "zh" ? "公共 AI 摘要" : "Public AI Digest"}</h2></div>${latest?.verdict ? latestBettingSummary(locale, latest.verdict) : `<p class="dim">${locale === "zh" ? "还没有公开 AI 摘要。" : "No public AI digest yet."}</p>`}</section>` +
+    `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "数据预览" : "Data Preview"}</h2><span class="badge info">${locale === "zh" ? "本地 JSON" : "Local JSON"}</span></div>${walrusDataPreview(locale)}</section>` +
+    `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "发布日志" : "Publish Log"}</h2></div>${walrusLogPanel(locale)}</section>` +
+    `</div><footer>${esc(COPY[locale].footer)}</footer>`;
+  return page(locale, "walrus", "Walrus Data · WC Radar", body, model, 120, "/walrus");
 }
 
 export function opportunitiesPage(locale: Locale = "zh"): string {
@@ -923,6 +1244,7 @@ export function matchPage(fixtureKey: string, locale: Locale = "zh"): string {
     `<div class="match-hero">${teamBadge(locale, row.homeTeam, "home")}<div class="countdown"><span class="dim">${esc(t.labels.countdown)}</span><strong>${esc(countdown(locale, row))}</strong>${row.live ? `<span class="live">${esc(t.labels.live)}</span>` : ""}</div>${teamBadge(locale, row.awayTeam, "away")}</div>` +
     `<div class="meta-grid"><div><span>${esc(t.labels.stage)}</span><b>${esc(t.labels.groupStage)}</b></div><div><span>${esc(t.labels.start)}</span><b>${esc(fullTime(locale, kickoff))} CST</b></div><div><span>${esc(t.labels.venue)}</span><b>${esc(t.labels.tbd)}</b></div><div><span>${esc(t.labels.status)}</span><b>${row.live ? esc(t.labels.live) : esc(countdown(locale, row))}</b></div><div><span>${esc(t.labels.fixture)}</span><b class="mono">${esc(row.fixtureKey)}</b></div></div>` +
     `</section>` +
+    bettingPlanPanel(locale, model, fixtureKey) +
     `<section class="bento">${aiAnalysisPanel(locale, fixtureKey, row, matchIntel)}<section class="span4 panel"><div class="panel-head"><h2>${esc(t.sections.riskPanel)}</h2></div>${matchIntel ? riskPanel(locale, matchIntel.riskSignals) : `<p class="dim">${esc(t.labels.insufficient)}</p>`}</section></section>` +
     `<div class="section-head"><h2>${esc(t.sections.sourceOdds)}</h2></div><div class="panel">${sourceTable(locale, row)}</div>` +
     `<div class="section-head"><h2>${esc(t.sections.related)}</h2></div>${related}` +

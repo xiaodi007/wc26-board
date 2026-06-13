@@ -1,11 +1,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   WALRUS_ENABLED,
   WALRUS_EPOCHS,
   WALRUS_NETWORK,
   WALRUS_PUBLISHER_URL,
 } from "./config.js";
-import { setMeta } from "./db.js";
+import { insertWalrusPublishLog, setMeta } from "./db.js";
 import { exportWalrusFeed, publicArtifact, WALRUS_SCHEMA_VERSION, type WalrusArtifact } from "./exports/walrusFeed.js";
 
 interface PublishedBlob {
@@ -62,14 +63,32 @@ async function publishFile(artifact: WalrusArtifact): Promise<PublishedBlob> {
   return parsePublishResponse(json);
 }
 
-async function main(): Promise<void> {
+export interface PublishWalrusOptions {
+  compact?: boolean;
+}
+
+export interface PublishWalrusResult {
+  manifestBlobId: string;
+  manifestObjectId: string | null;
+  artifactCount: number;
+  totalBytes: number;
+}
+
+function publishableArtifacts(artifacts: WalrusArtifact[], compact: boolean): WalrusArtifact[] {
+  if (!compact) return artifacts.filter((a) => a.relativePath !== "manifest-latest.json");
+  const keep = new Set(["radar-latest.json", "opportunities-latest.json", "ai-board-latest.json"]);
+  return artifacts.filter((a) => keep.has(a.relativePath));
+}
+
+export async function publishWalrusSnapshot(options: PublishWalrusOptions = {}): Promise<PublishWalrusResult> {
   if (!WALRUS_ENABLED) {
     throw new Error("WALRUS_ENABLED=true is required for publish. Use npm run export:walrus for local-only export.");
   }
 
   const exported = exportWalrusFeed();
   const publishedArtifacts = [];
-  for (const artifact of exported.artifacts.filter((a) => a.relativePath !== "manifest-latest.json")) {
+  const artifacts = publishableArtifacts(exported.artifacts, Boolean(options.compact));
+  for (const artifact of artifacts) {
     const published = await publishFile(artifact);
     publishedArtifacts.push({ ...publicArtifact(artifact), walrus: { blob_id: published.blobId, object_id: published.objectId } });
     console.log(`walrus publish: ${artifact.relativePath} -> ${published.blobId}`);
@@ -92,12 +111,36 @@ async function main(): Promise<void> {
   setMeta("walrus_latest_network", WALRUS_NETWORK);
   setMeta("walrus_latest_schema_version", WALRUS_SCHEMA_VERSION);
   setMeta("walrus_latest_error", "");
+  setMeta("walrus_latest_artifact_count", String(publishedArtifacts.length + 1));
+  setMeta("walrus_latest_total_bytes", String(artifacts.reduce((sum, artifact) => sum + artifact.bytes, manifestArtifact.bytes)));
+  insertWalrusPublishLog({
+    status: "success",
+    network: WALRUS_NETWORK,
+    manifestBlobId: publishedManifest.blobId,
+    manifestObjectId: publishedManifest.objectId,
+    artifactCount: publishedArtifacts.length + 1,
+    totalBytes: artifacts.reduce((sum, artifact) => sum + artifact.bytes, manifestArtifact.bytes),
+    detail: options.compact ? "compact" : "full",
+  });
   console.log(`walrus publish: manifest -> ${publishedManifest.blobId}`);
+  return {
+    manifestBlobId: publishedManifest.blobId,
+    manifestObjectId: publishedManifest.objectId,
+    artifactCount: publishedArtifacts.length + 1,
+    totalBytes: artifacts.reduce((sum, artifact) => sum + artifact.bytes, manifestArtifact.bytes),
+  };
 }
 
-main().catch((e) => {
-  const message = e instanceof Error ? e.message : String(e);
-  setMeta("walrus_latest_error", message.slice(0, 500));
-  console.error(`walrus publish: ${message}`);
-  process.exitCode = 1;
-});
+async function main(): Promise<void> {
+  await publishWalrusSnapshot({ compact: process.argv.includes("--compact") });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    const message = e instanceof Error ? e.message : String(e);
+    setMeta("walrus_latest_error", message.slice(0, 500));
+    insertWalrusPublishLog({ status: "error", network: WALRUS_NETWORK, detail: message.slice(0, 500) });
+    console.error(`walrus publish: ${message}`);
+    process.exitCode = 1;
+  });
+}

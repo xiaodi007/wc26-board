@@ -83,12 +83,31 @@ CREATE TABLE IF NOT EXISTS ai_analysis (
   response TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_fixture ON ai_analysis(fixture_key, ts);
+CREATE TABLE IF NOT EXISTS ai_board_analysis (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  model TEXT,
+  system_prompt TEXT,
+  user_prompt TEXT NOT NULL,
+  response TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS alert_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT DEFAULT (datetime('now')),
   kind TEXT NOT NULL,
   dedup_key TEXT NOT NULL UNIQUE,
   title TEXT NOT NULL,
+  detail TEXT
+);
+CREATE TABLE IF NOT EXISTS walrus_publish_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  status TEXT NOT NULL,
+  network TEXT,
+  manifest_blob_id TEXT,
+  manifest_object_id TEXT,
+  artifact_count INTEGER DEFAULT 0,
+  total_bytes INTEGER DEFAULT 0,
   detail TEXT
 );
 `;
@@ -393,6 +412,12 @@ const stmtInsertAnalysis = db.prepare(
 const stmtListAnalyses = db.prepare(
   `SELECT * FROM ai_analysis WHERE fixture_key=? ORDER BY ts DESC, id DESC LIMIT ?`
 );
+const stmtInsertBoardAnalysis = db.prepare(
+  `INSERT INTO ai_board_analysis (model, system_prompt, user_prompt, response) VALUES (?, ?, ?, ?)`
+);
+const stmtListBoardAnalyses = db.prepare(
+  `SELECT * FROM ai_board_analysis ORDER BY ts DESC, id DESC LIMIT ?`
+);
 
 export function insertAnalysis(fixtureKey: string, model: string, systemPrompt: string, userPrompt: string, response: string): number {
   return Number(stmtInsertAnalysis.run(fixtureKey, model, systemPrompt, userPrompt, response).lastInsertRowid);
@@ -400,6 +425,23 @@ export function insertAnalysis(fixtureKey: string, model: string, systemPrompt: 
 
 export function listAnalyses(fixtureKey: string, limit = 5): AiAnalysisRow[] {
   return stmtListAnalyses.all(fixtureKey, Math.min(Math.max(limit, 1), 20)) as AiAnalysisRow[];
+}
+
+export interface AiBoardAnalysisRow {
+  id: number;
+  ts: string;
+  model: string | null;
+  system_prompt: string | null;
+  user_prompt: string;
+  response: string;
+}
+
+export function insertBoardAnalysis(model: string, systemPrompt: string, userPrompt: string, response: string): number {
+  return Number(stmtInsertBoardAnalysis.run(model, systemPrompt, userPrompt, response).lastInsertRowid);
+}
+
+export function listBoardAnalyses(limit = 5): AiBoardAnalysisRow[] {
+  return stmtListBoardAnalyses.all(Math.min(Math.max(limit, 1), 20)) as AiBoardAnalysisRow[];
 }
 
 export interface AlertRow {
@@ -428,4 +470,48 @@ export function listRecentAlerts(limit = 10): AlertRow[] {
 
 export function countAlerts24h(): number {
   return (stmtCountAlerts24h.get() as { n: number }).n;
+}
+
+export interface WalrusPublishLogRow {
+  id: number;
+  ts: string;
+  status: "success" | "error" | string;
+  network: string | null;
+  manifest_blob_id: string | null;
+  manifest_object_id: string | null;
+  artifact_count: number;
+  total_bytes: number;
+  detail: string | null;
+}
+
+const stmtInsertWalrusPublishLog = db.prepare(
+  `INSERT INTO walrus_publish_log (status, network, manifest_blob_id, manifest_object_id, artifact_count, total_bytes, detail)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
+);
+const stmtListWalrusPublishLog = db.prepare(`SELECT * FROM walrus_publish_log ORDER BY ts DESC, id DESC LIMIT ?`);
+
+export function insertWalrusPublishLog(row: {
+  status: "success" | "error";
+  network?: string | null;
+  manifestBlobId?: string | null;
+  manifestObjectId?: string | null;
+  artifactCount?: number;
+  totalBytes?: number;
+  detail?: string | null;
+}): number {
+  return Number(
+    stmtInsertWalrusPublishLog.run(
+      row.status,
+      row.network ?? null,
+      row.manifestBlobId ?? null,
+      row.manifestObjectId ?? null,
+      row.artifactCount ?? 0,
+      row.totalBytes ?? 0,
+      row.detail ?? null
+    ).lastInsertRowid
+  );
+}
+
+export function listWalrusPublishLog(limit = 10): WalrusPublishLogRow[] {
+  return stmtListWalrusPublishLog.all(Math.min(Math.max(limit, 1), 50)) as WalrusPublishLogRow[];
 }

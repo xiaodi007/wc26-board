@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { WALRUS_FEED_DIR, WALRUS_NETWORK } from "../config.js";
+import { latestBoardVerdict } from "../ai/boardPlan.js";
 import { getSourceFreshness } from "../queries/healthChecks.js";
 import {
   getMarketRadar,
@@ -242,6 +243,22 @@ export function exportWalrusFeed(outDir = WALRUS_FEED_DIR, limit = 70): WalrusEx
       sampled_flags: { any_sampled: sampledMarkets > 0, sampled_markets: sampledMarkets },
       opportunities: opportunityRows,
       markets: marketRows,
+    })
+  );
+
+  const latestAi = latestBoardVerdict();
+  artifacts.push(
+    writeJson(outDir, "ai-board-latest.json", {
+      ...base,
+      note: "Public unit-level AI betting reference only. User bankroll, stake amounts, API keys, and private prompts are never exported.",
+      latest_analysis: latestAi
+        ? {
+            id: latestAi.row.id,
+            ts: latestAi.row.ts,
+            model: latestAi.row.model,
+            verdict: latestAi.verdict,
+          }
+        : null,
     })
   );
 

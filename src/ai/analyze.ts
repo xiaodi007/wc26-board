@@ -151,6 +151,15 @@ interface AiProvider {
   reasoningEffort?: string;
 }
 
+export interface AiProviderOverride {
+  provider?: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  thinking?: string;
+  temperature?: string;
+}
+
 export interface CurrentAiProvider {
   id: AiProviderId;
   label: string;
@@ -181,16 +190,30 @@ const PROVIDER_ALIASES: Record<string, AiProviderId> = {
 // 这些代际支持 adaptive thinking;其它(如 haiku)不送 thinking 字段
 const ADAPTIVE_OK = /fable|opus-4-[678]|sonnet-4-6/;
 
-function activeProviderId(): AiProviderId {
-  const id = PROVIDER_ALIASES[AI_PROVIDER];
-  if (!id) throw new Error(`unsupported AI_PROVIDER=${AI_PROVIDER}; use anthropic, deepseek, kimi, or openai-compatible`);
+function activeProviderId(rawProvider = AI_PROVIDER): AiProviderId {
+  const id = PROVIDER_ALIASES[String(rawProvider || "").toLowerCase()];
+  if (!id) throw new Error(`unsupported AI_PROVIDER=${rawProvider}; use anthropic, deepseek, kimi, or openai-compatible`);
   return id;
 }
 
-function getProvider(): AiProvider {
-  switch (activeProviderId()) {
+function withOverride(provider: AiProvider, override?: AiProviderOverride): AiProvider {
+  if (!override) return provider;
+  return {
+    ...provider,
+    key: typeof override.apiKey === "string" && override.apiKey.trim() ? override.apiKey.trim() : provider.key,
+    baseUrl: typeof override.baseUrl === "string" && override.baseUrl.trim() ? override.baseUrl.trim() : provider.baseUrl,
+    model: typeof override.model === "string" && override.model.trim() ? override.model.trim() : provider.model,
+    thinking: typeof override.thinking === "string" && override.thinking.trim() ? override.thinking.trim() : provider.thinking,
+    temperature: typeof override.temperature === "string" && override.temperature.trim() ? override.temperature.trim() : provider.temperature,
+  };
+}
+
+function getProvider(override?: AiProviderOverride): AiProvider {
+  const active = activeProviderId(override?.provider);
+  let provider: AiProvider;
+  switch (active) {
     case "anthropic":
-      return {
+      provider = {
         id: "anthropic",
         kind: "anthropic",
         label: "Anthropic",
@@ -201,8 +224,9 @@ function getProvider(): AiProvider {
         baseConfigName: "ANTHROPIC_BASE_URL",
         modelConfigName: "ANTHROPIC_MODEL",
       };
+      break;
     case "deepseek":
-      return {
+      provider = {
         id: "deepseek",
         kind: "openai-compatible",
         label: "DeepSeek",
@@ -217,8 +241,9 @@ function getProvider(): AiProvider {
         thinkingModel: DEEPSEEK_THINKING_MODEL,
         reasoningEffort: DEEPSEEK_REASONING_EFFORT,
       };
+      break;
     case "kimi":
-      return {
+      provider = {
         id: "kimi",
         kind: "openai-compatible",
         label: "Kimi",
@@ -231,8 +256,9 @@ function getProvider(): AiProvider {
         temperature: KIMI_TEMPERATURE,
         thinking: KIMI_THINKING,
       };
+      break;
     case "openai-compatible":
-      return {
+      provider = {
         id: "openai-compatible",
         kind: "openai-compatible",
         label: "OpenAI-compatible",
@@ -243,7 +269,9 @@ function getProvider(): AiProvider {
         baseConfigName: "OPENAI_COMPAT_BASE_URL 或 OPENAI_BASE_URL",
         modelConfigName: "OPENAI_COMPAT_MODEL 或 OPENAI_MODEL",
       };
+      break;
   }
+  return withOverride(provider, override);
 }
 
 function missingProviderConfig(provider: AiProvider): string | null {
@@ -253,8 +281,8 @@ function missingProviderConfig(provider: AiProvider): string | null {
   return null;
 }
 
-export function currentAiProvider(): CurrentAiProvider {
-  const provider = getProvider();
+export function currentAiProvider(override?: AiProviderOverride): CurrentAiProvider {
+  const provider = getProvider(override);
   const missingConfig = missingProviderConfig(provider);
   return {
     id: provider.id,
@@ -267,9 +295,9 @@ export function currentAiProvider(): CurrentAiProvider {
   };
 }
 
-export function hasApiKey(): boolean {
+export function hasApiKey(override?: AiProviderOverride): boolean {
   try {
-    return currentAiProvider().keyReady;
+    return currentAiProvider(override).keyReady;
   } catch {
     return false;
   }
@@ -469,20 +497,20 @@ export interface AnalysisOutcome {
   context: MatchContext;
 }
 
-async function callProvider(system: string, userPrompt: string): Promise<ProviderResult> {
-  const provider = getProvider();
+export async function callProvider(system: string, userPrompt: string, override?: AiProviderOverride): Promise<ProviderResult> {
+  const provider = getProvider(override);
   const missingConfig = missingProviderConfig(provider);
-  if (missingConfig) throw new Error(`${missingConfig} is not set for AI_PROVIDER=${AI_PROVIDER}`);
+  if (missingConfig) throw new Error(`${missingConfig} is not set for AI_PROVIDER=${provider.id}`);
   if (provider.kind === "anthropic") return callAnthropic(provider, system, userPrompt);
   return callOpenAiCompatible(provider, system, userPrompt);
 }
 
-export async function analyzeMatch(fixtureKey: string): Promise<AnalysisOutcome> {
+export async function analyzeMatch(fixtureKey: string, override?: AiProviderOverride): Promise<AnalysisOutcome> {
   const context = buildMatchContext(fixtureKey);
   if (!context) throw new Error(`fixture not found or already kicked off: ${fixtureKey}`);
 
   const system = currentSystemPrompt();
-  const result = await callProvider(system, context.prompt);
+  const result = await callProvider(system, context.prompt, override);
 
   const verdict = parseVerdict(result.raw);
   const storedRaw = verdict ? JSON.stringify(verdict) : result.raw;

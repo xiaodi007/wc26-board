@@ -26,14 +26,26 @@ quick tunnel is the current workaround.
 
 ## Latest Deployment
 
-- Latest app rebuild/restart: 2026-06-13 12:14 CST
-- Deployed change: board read-path performance fix for sidebar navigation and
-  market radar pages. The fix batches current-odds and Polymarket volatility
-  queries and avoids duplicate current-odds reads on the home page.
+- Latest app rebuild/restart: 2026-06-13 13:33 CST
+- Deployed change: AI Betting Plan compact card + modal on home/match pages,
+  prompt language routing with English default and `?lang=zh` Chinese prompts,
+  plus `/walrus` manifest/artifact links and local JSON data previews.
 - Verification: `docker compose exec -T board npm run health` returned
   `10 pass, 0 warn, 0 fail`.
-- Public quick-tunnel warm-path timings after deploy were approximately:
-  `/` 1.29s, `/opportunities` 0.65s, `/api/radar` 0.92s.
+- `docker compose exec -T board npm run status` showed 140 source rows,
+  70 fixtures, and next-24h matches available.
+- Walrus testnet compact publish succeeded at 2026-06-13 13:34 CST using a
+  one-off public publisher endpoint injection:
+  manifest blob `xYuz11Otvz_gMjA5FJYDZQROBerh_sxTAolrp_MKC_o`, 4 artifacts,
+  725,443 bytes, empty `walrus_latest_error`.
+- AI smoke call to public `/api/analyze-board` with `1000` bankroll and `30`
+  max loss correctly returned `503 no_api_key` because the demo `.env` has no
+  provider key (`ANTHROPIC_API_KEY` missing). `/api/board-prompt` returns an
+  English prompt by default and `/api/board-prompt?lang=zh` returns Chinese.
+- Public quick-tunnel checks after deploy returned HTTP 200 for `/`,
+  `/?lang=en`, `/match?...&lang=en`, `/walrus?lang=en`, `/api/walrus`, and
+  `/api/board-prompt`. `/walrus?lang=en` includes Data Preview, Open
+  `/api/walrus`, and artifact action links.
 
 The first request after a container recreate can be slower due to cold startup
 and SQLite cache warming. The Cloudflare quick tunnel still adds noticeable
@@ -47,8 +59,8 @@ The remote Compose stack has four services:
 | --- | --- |
 | `daemon` | runs `npm run daemon` and continuously collects market data |
 | `board` | runs `npm run board`; binds the app to `127.0.0.1:4626` |
-| `proxy` | Caddy reverse proxy from `:4627` to `127.0.0.1:4626` |
-| `tunnel` | Cloudflare quick tunnel to `http://127.0.0.1:4627` |
+| `board-proxy` | Caddy reverse proxy from `:4627` to `127.0.0.1:4626` |
+| `board-tunnel` | Cloudflare quick tunnel to `http://127.0.0.1:4627` |
 
 The generated runtime files live on the VPS, not in the repository:
 
@@ -76,14 +88,14 @@ Check containers and logs:
 docker compose ps
 docker compose logs --tail=120 daemon
 docker compose logs --tail=120 board
-docker compose logs --tail=120 proxy
-docker compose logs --tail=120 tunnel
+docker compose logs --tail=120 board-proxy
+docker compose logs --tail=120 board-tunnel
 ```
 
 Restart the app:
 
 ```bash
-docker compose restart daemon board proxy tunnel
+docker compose restart daemon board board-proxy board-tunnel
 ```
 
 Rebuild after syncing code:
@@ -109,7 +121,7 @@ curl -I http://127.0.0.1:4627
 The tunnel URL can be found in the tunnel logs:
 
 ```bash
-docker compose logs tunnel | grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' | tail -1
+docker compose logs board-tunnel | grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' | tail -1
 ```
 
 ## Refreshing The Deployment
@@ -123,6 +135,13 @@ rsync -az --delete \
   --exclude .git \
   --exclude dist \
   --exclude logs \
+  --exclude .env \
+  --exclude Dockerfile \
+  --exclude compose.yml \
+  --exclude Caddyfile \
+  --exclude 'data/*.db' \
+  --exclude 'data/*.db-*' \
+  --exclude data/imports \
   --exclude data/walrus-feed \
   ./ ubuntu@43.135.135.137:/home/ubuntu/apps/wc26-board/
 ```
@@ -160,8 +179,25 @@ Common variables:
 - `ODDSAPI_POLL_MS`
 - `AI_PROVIDER` and the chosen provider key
 - `SERVERCHAN_KEY`
-- `WALRUS_*`
+- `WALRUS_*`; for one-off public testnet publishing, the verified public
+  endpoints are `https://publisher.walrus-testnet.walrus.space` and
+  `https://aggregator.walrus-testnet.walrus.space`
 - `BOARD_PORT=4626`
+
+The current demo `.env` does not persist `WALRUS_PUBLISHER_URL`. For one-off
+compact publishes, use:
+
+```bash
+docker compose exec -T \
+  -e WALRUS_PUBLISHER_URL=https://publisher.walrus-testnet.walrus.space \
+  -e WALRUS_AGGREGATOR_URL=https://aggregator.walrus-testnet.walrus.space \
+  board npm run publish:walrus:testnet:compact
+```
+
+AI provider keys are intentionally absent from the current demo `.env`. The
+board therefore shows the copy-prompt fallback and `/api/analyze-board` returns
+`no_api_key` until one of `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
+`KIMI_API_KEY`/`MOONSHOT_API_KEY`, or `OPENAI_COMPAT_API_KEY` is added.
 
 ## Verification Checklist
 
@@ -172,6 +208,7 @@ docker compose ps
 docker compose exec board npm run health
 docker compose exec board npm run status
 curl -I http://127.0.0.1:4627
+curl -s http://127.0.0.1:4627/api/walrus
 ```
 
 Expected current health state after the initial VPS deployment was:
@@ -184,6 +221,9 @@ Also open the public tunnel URL and check:
 
 - home page renders in Chinese and English with `?lang=zh` / `?lang=en`
 - match detail pages load
+- `/walrus?lang=zh` loads and `/api/walrus` shows latest manifest metadata
+- `/api/analyze-board?lang=zh` either returns a parsed plan when a provider key
+  is configured or returns `no_api_key` without logging secret material
 - PM liquidity/participation panels show data or clear sampled/degraded states
 - no obvious mobile overflow on a narrow viewport
 
