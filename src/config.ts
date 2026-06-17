@@ -64,6 +64,7 @@ const walrusFeedDirRaw = process.env.WALRUS_FEED_DIR || "data/walrus-feed";
 export const WALRUS_ENABLED = (process.env.WALRUS_ENABLED || "false").toLowerCase() === "true";
 export const WALRUS_NETWORK = process.env.WALRUS_NETWORK || "testnet";
 export const WALRUS_EPOCHS = Number(process.env.WALRUS_EPOCHS || 3);
+export const WALRUS_PUBLISH_MS = Number(process.env.WALRUS_PUBLISH_MS || 60 * 60 * 1000);
 export const WALRUS_PUBLISHER_URL = process.env.WALRUS_PUBLISHER_URL || "";
 export const WALRUS_AGGREGATOR_URL = process.env.WALRUS_AGGREGATOR_URL || "";
 export const WALRUS_FEED_DIR = isAbsolute(walrusFeedDirRaw) ? walrusFeedDirRaw : join(ROOT, walrusFeedDirRaw);
