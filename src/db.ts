@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { DB_PATH } from "./config.js";
-import { fixtureKey, fixtureTeamDayKey, isSameFixtureWindow } from "./fixtures.js";
+import { fixtureKey, fixtureTeamDayKey, isSameFixtureWindow, kickoffDiffMs, FIXTURE_MERGE_WINDOW_MS } from "./fixtures.js";
 
 // schema 来源: deepseek-pro 设计稿(sui-research/sources/raw/wc26-deepseek-2026-06-12.md §1.4)
 // snapshot 只追加;market/outcome 是维表;event_id 可空(冠军盘等赛事级市场不挂单场)
@@ -153,6 +153,8 @@ CREATE INDEX IF NOT EXISTS idx_match_event_fixture ON match_event(fixture_key, m
 
 export const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+// daemon 与 board 双进程共用此库;无 busy_timeout 时并发写会直接 SQLITE_BUSY 抛错,给 5s 重试窗口
+db.pragma("busy_timeout = 5000");
 db.exec(SCHEMA);
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -242,13 +244,26 @@ const stmtEventsWithSources = db.prepare(
 const stmtUpdateFixtureKey = db.prepare(`UPDATE event SET fixture_key=? WHERE id=?`);
 const stmtUpdateAnalysisFixtureKey = db.prepare(`UPDATE ai_analysis SET fixture_key=? WHERE fixture_key=?`);
 const stmtUpdateBoardAnalysisFixtureKey = db.prepare(`UPDATE ai_board_analysis SET fixture_key=? WHERE fixture_key=?`);
+// 赛果/事件也按 fixture_key 关联,但有 UNIQUE(fixture_key, source[, event_key]):key 漂移时整体迁到新 key;
+// 若新 key 已存在同源行(漂移后新写入、更鲜),迁移被 IGNORE,残留的旧孤儿随后删除。
+const stmtMoveMatchResultKey = db.prepare(`UPDATE OR IGNORE match_result SET fixture_key=? WHERE fixture_key=?`);
+const stmtDropMatchResultKey = db.prepare(`DELETE FROM match_result WHERE fixture_key=?`);
+const stmtMoveMatchEventKey = db.prepare(`UPDATE OR IGNORE match_event SET fixture_key=? WHERE fixture_key=?`);
+const stmtDropMatchEventKey = db.prepare(`DELETE FROM match_event WHERE fixture_key=?`);
 
 function syncFixtureKey(row: EventFixtureRow, nextKey: string): void {
   const prevKey = row.fixture_key;
   if (prevKey !== nextKey) {
     stmtUpdateFixtureKey.run(nextKey, row.id);
-    if (prevKey) stmtUpdateAnalysisFixtureKey.run(nextKey, prevKey);
-    if (prevKey) stmtUpdateBoardAnalysisFixtureKey.run(nextKey, prevKey);
+    if (prevKey) {
+      stmtUpdateAnalysisFixtureKey.run(nextKey, prevKey);
+      stmtUpdateBoardAnalysisFixtureKey.run(nextKey, prevKey);
+      // 赛果/事件必须跟着 canonical key 走,否则复盘按新 key 查不到、已采集的比分凭空消失
+      stmtMoveMatchResultKey.run(nextKey, prevKey);
+      stmtDropMatchResultKey.run(prevKey);
+      stmtMoveMatchEventKey.run(nextKey, prevKey);
+      stmtDropMatchEventKey.run(prevKey);
+    }
     row.fixture_key = nextKey;
   }
 }
@@ -284,6 +299,50 @@ const backfillApproximateFixtureKeys = db.transaction(() => {
   canonicalizeClusters(stmtEventsWithSources.all() as EventFixtureRow[]);
 });
 backfillApproximateFixtureKeys();
+
+// 自愈:syncFixtureKey 修复前遗留的孤儿赛果/事件(fixture_key 已漂移、event 表查不到 → 复盘比分消失)。
+// 按"队名段一致 + 开球在合并窗口内"归位到 canonical event key;无对应 event 的保持原样不动。
+function splitFixtureKey(key: string): { teamKey: string; kickoff: string } {
+  const i = key.lastIndexOf("|");
+  return i < 0 ? { teamKey: key, kickoff: "" } : { teamKey: key.slice(0, i), kickoff: key.slice(i + 1) };
+}
+function canonicalKeyForOrphan(orphanKey: string, eventKeys: string[]): string | null {
+  const orphan = splitFixtureKey(orphanKey);
+  let best: string | null = null;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const ek of eventKeys) {
+    const cand = splitFixtureKey(ek);
+    if (cand.teamKey !== orphan.teamKey) continue;
+    const diff = kickoffDiffMs(orphan.kickoff, cand.kickoff);
+    if (diff === null || diff > FIXTURE_MERGE_WINDOW_MS) continue;
+    if (diff < bestDiff) {
+      best = ek;
+      bestDiff = diff;
+    }
+  }
+  return best;
+}
+const healOrphanedMatchData = db.transaction(() => {
+  const eventKeys = (
+    db.prepare(`SELECT DISTINCT fixture_key FROM event WHERE fixture_key IS NOT NULL AND fixture_key<>''`).all() as { fixture_key: string }[]
+  ).map((r) => r.fixture_key);
+  for (const table of ["match_result", "match_event"] as const) {
+    const move = table === "match_result" ? stmtMoveMatchResultKey : stmtMoveMatchEventKey;
+    const drop = table === "match_result" ? stmtDropMatchResultKey : stmtDropMatchEventKey;
+    const orphans = (
+      db.prepare(
+        `SELECT DISTINCT fixture_key FROM ${table} t WHERE NOT EXISTS (SELECT 1 FROM event e WHERE e.fixture_key=t.fixture_key)`
+      ).all() as { fixture_key: string }[]
+    ).map((r) => r.fixture_key);
+    for (const orphanKey of orphans) {
+      const canonical = canonicalKeyForOrphan(orphanKey, eventKeys);
+      if (!canonical || canonical === orphanKey) continue;
+      move.run(canonical, orphanKey);
+      drop.run(orphanKey);
+    }
+  }
+});
+healOrphanedMatchData();
 
 const stmtUpsertEvent = db.prepare(
   `INSERT INTO event (id, home_team, away_team, kickoff_utc, fixture_key, status) VALUES (?, ?, ?, ?, ?, ?)
