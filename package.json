@@ -7,6 +7,7 @@
     "bootstrap": "tsx src/bootstrap.ts",
     "poll": "tsx src/poll.ts",
     "daemon": "tsx src/daemon.ts",
+    "results": "tsx src/results.ts",
     "status": "tsx src/status.ts",
     "health": "tsx src/health.ts",
     "board": "tsx src/server.ts",

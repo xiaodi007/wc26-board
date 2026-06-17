@@ -1,5 +1,5 @@
 import { API_FOOTBALL_KEY, ODDS_API_KEY } from "../config.js";
-import { db } from "../db.js";
+import { db, getMeta } from "../db.js";
 
 export interface MatchResultRow {
   id: number;
@@ -41,7 +41,20 @@ export interface MatchEventBundle {
   configured: {
     apiFootball: boolean;
     oddsApiScores: boolean;
+    sportteryResults: boolean;
+    sources: Record<ResultSourceId, ResultSourceStatus>;
   };
+}
+
+export type ResultSourceId = "apiFootball" | "sportteryResults" | "oddsApiScores";
+
+export interface ResultSourceStatus {
+  configured: boolean;
+  available: boolean;
+  lastCall: string | null;
+  matchedRows: number;
+  rows: number;
+  providesEvents: boolean;
 }
 
 interface RawResultRow {
@@ -79,7 +92,8 @@ interface RawEventRow {
 
 const SOURCE_PRIORITY = new Map([
   ["api_football", 0],
-  ["oddsapi", 1],
+  ["sporttery_results", 1],
+  ["oddsapi", 2],
 ]);
 
 const resultStmt = db.prepare(
@@ -87,7 +101,7 @@ const resultStmt = db.prepare(
    FROM match_result
    WHERE fixture_key=?
    ORDER BY
-     CASE source WHEN 'api_football' THEN 0 WHEN 'oddsapi' THEN 1 ELSE 9 END,
+     CASE source WHEN 'api_football' THEN 0 WHEN 'sporttery_results' THEN 1 WHEN 'oddsapi' THEN 2 ELSE 9 END,
      datetime(COALESCE(last_update_ts, created_at)) DESC,
      id DESC`
 );
@@ -97,7 +111,7 @@ const eventStmt = db.prepare(
    FROM match_event
    WHERE fixture_key=?
    ORDER BY
-     CASE source WHEN 'api_football' THEN 0 WHEN 'oddsapi' THEN 1 ELSE 9 END,
+     CASE source WHEN 'api_football' THEN 0 WHEN 'sporttery_results' THEN 1 WHEN 'oddsapi' THEN 2 ELSE 9 END,
      COALESCE(minute, 999),
      COALESCE(extra_minute, 0),
      id`
@@ -144,6 +158,55 @@ function sourceRank(source: string): number {
   return SOURCE_PRIORITY.get(source) ?? 9;
 }
 
+function numberMeta(key: string): number {
+  const value = Number(getMeta(key) ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function sourceStatus(args: {
+  configured: boolean;
+  lastCallKey: string;
+  matchedKey: string;
+  rowsKey: string;
+  providesEvents: boolean;
+}): ResultSourceStatus {
+  const lastCall = getMeta(args.lastCallKey);
+  return {
+    configured: args.configured,
+    available: Boolean(lastCall),
+    lastCall,
+    matchedRows: numberMeta(args.matchedKey),
+    rows: numberMeta(args.rowsKey),
+    providesEvents: args.providesEvents,
+  };
+}
+
+export function getResultSourceStatuses(): Record<ResultSourceId, ResultSourceStatus> {
+  return {
+    apiFootball: sourceStatus({
+      configured: Boolean(API_FOOTBALL_KEY),
+      lastCallKey: "api_football_last_call",
+      matchedKey: "api_football_matched",
+      rowsKey: "api_football_rows",
+      providesEvents: true,
+    }),
+    sportteryResults: sourceStatus({
+      configured: true,
+      lastCallKey: "sporttery_results_last_call",
+      matchedKey: "sporttery_results_matched",
+      rowsKey: "sporttery_results_rows",
+      providesEvents: false,
+    }),
+    oddsApiScores: sourceStatus({
+      configured: Boolean(ODDS_API_KEY),
+      lastCallKey: "oddsapi_scores_last_call",
+      matchedKey: "oddsapi_scores_matched",
+      rowsKey: "oddsapi_scores_rows",
+      providesEvents: false,
+    }),
+  };
+}
+
 export function getMatchEventBundle(fixtureKey: string): MatchEventBundle {
   const results = (resultStmt.all(fixtureKey) as RawResultRow[]).map(resultRow);
   const result = results[0] ?? null;
@@ -151,6 +214,7 @@ export function getMatchEventBundle(fixtureKey: string): MatchEventBundle {
   const events = (eventStmt.all(fixtureKey) as RawEventRow[])
     .map(eventRow)
     .filter((event) => !result || sourceRank(event.source) <= sourceRank(preferredSource));
+  const sources = getResultSourceStatuses();
   return {
     result,
     results,
@@ -158,6 +222,8 @@ export function getMatchEventBundle(fixtureKey: string): MatchEventBundle {
     configured: {
       apiFootball: Boolean(API_FOOTBALL_KEY),
       oddsApiScores: Boolean(ODDS_API_KEY),
+      sportteryResults: sources.sportteryResults.available,
+      sources,
     },
   };
 }

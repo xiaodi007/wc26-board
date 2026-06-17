@@ -274,6 +274,9 @@ export async function pollApiFootballResults(): Promise<number> {
   }
 
   setMeta("api_football_last_call", now);
+  setMeta("api_football_rows", String(fixtures.length));
+  setMeta("api_football_matched", String(matched));
+  setMeta("api_football_events_upserted", String(eventRows));
   setMeta("results_last_call", now);
   if (unmatched.size) log(`api-football: unmatched fixtures skipped: ${[...unmatched].slice(0, 8).join(" ; ")}`);
   log(`api-football: matched ${matched}/${fixtures.length} fixtures, upserted ${eventRows} events`);

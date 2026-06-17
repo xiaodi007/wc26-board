@@ -132,6 +132,8 @@ export async function pollScores(): Promise<number> {
     n += 1;
   }
   setMeta("oddsapi_scores_last_call", now);
+  setMeta("oddsapi_scores_rows", String(data.length));
+  setMeta("oddsapi_scores_matched", String(n));
   setMeta("results_last_call", now);
   log(`oddsapi scores: ${n}/${data.length} results upserted`);
   return n;
