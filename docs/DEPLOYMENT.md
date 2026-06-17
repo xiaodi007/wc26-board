@@ -1,6 +1,6 @@
 # Demo Deployment Runbook
 
-Last verified: 2026-06-13
+Last verified: 2026-06-17
 
 This document records the current demo deployment so a future session can catch
 up without rediscovering the server layout. Do not write VPS passwords, API
@@ -26,35 +26,33 @@ quick tunnel is the current workaround.
 
 ## Latest Deployment
 
-- Latest app rebuild/restart: 2026-06-13 21:00 CST
-- Deployed change: global matched-score display on match cards/review cards and
-  completed-match detail pages, winner/loser/draw semantic colors, highest 1X2
-  probability highlighting, mobile review-card overflow fix, and updated docs.
-- Public demo URL remains:
+- Latest app rebuild/restart: 2026-06-17 17:13 CST (09:13 UTC)
+- Deployed change: fix review scores disappearing on fixture-key drift
+  (`syncFixtureKey` now moves `match_result`/`match_event` with the canonical
+  key; a startup self-heal re-points rows orphaned before the fix; `busy_timeout`
+  added for the shared daemon/board SQLite connection — see commit
+  `Fix review scores lost to fixture-key drift`). Also rotated `ODDS_API_KEY`:
+  the previous key began returning `HTTP 401` around 2026-06-14 (free-tier quota
+  exhausted), so no scores were collected for ~3 days and the review board showed
+  completed matches with no result.
+- Public demo URL unchanged (proxy/tunnel containers were left untouched):
   `https://crossing-tide-extra-explicit.trycloudflare.com`.
-- Verification: `docker compose exec -T board npm exec tsc -- --noEmit` passed.
-  `docker compose exec -T board npm run health` returned
-  `9 pass, 1 warn, 0 fail`. The only warn remained Sporttery freshness:
-  latest remote Sporttery snapshot was `2026-06-12T13:59:28.924Z`; PM, Kalshi,
-  and Odds API were fresh after restart.
-- `docker compose exec -T board npm run status` showed 142 source rows,
-  72 fixtures, PM fresh at 2026-06-13 12:59 UTC, Kalshi fresh at
-  2026-06-13 12:59 UTC, Odds API fresh at 2026-06-13 12:39 UTC, and next-24h
-  matches available.
-- `docker compose exec -T board npm run results` exited 0. Sporttery score
-  fallback returned remote `HTTP 567 Unknown Status`; The Odds API scores
-  upserted `4/72` completed results.
-- Internal proxy smoke returned HTTP 200 for `/`, `/radar?lang=zh`,
-  `/review?lang=zh`, and
-  `/match?fk=united%20states%7Cparaguay%7C2026-06-13T01%3A02%3A00Z&lang=zh`.
-  The review and completed-match pages included `rv-card-score has-score`,
-  `match-result-center`, `result-winner`, `result-loser`, `result-draw`, and
-  `prob-leader` markers.
-- Public quick-tunnel checks returned HTTP 200 for `/`, `/radar?lang=zh`,
-  `/review?lang=zh`, and the same completed-match detail page. Public HTML
-  included the score/result and probability highlight markers.
-- Daemon logs confirmed the current startup line includes
-  `Sporttery every ... results every ... Walrus publish every ...`.
+- Deploy method: `rsync` of `src` (runbook excludes), `sed` the remote `.env`
+  `ODDS_API_KEY` line (a timestamped `.env.bak.*` was left on the VPS),
+  `docker compose build` (npm ci layer cached), then
+  `docker compose up -d daemon board` only.
+- Verification: daemon recreated and logged `oddsapi: 52 events ... snapshots`
+  with no `401`. `docker compose exec -T board npm run results` upserted
+  `12/64` completed results (the matches missing since 2026-06-14; Sporttery
+  fallback still returned remote `HTTP 567 Unknown Status`).
+  `docker compose exec -T board npm run health` returned `9 pass, 1 warn,
+  0 fail` — the warn remains Sporttery freshness; Odds API/PM/Kalshi fresh.
+- Internal proxy (`:4627`) and the public tunnel both returned HTTP 200 for
+  `/review?lang=zh` with 19 `rv-card-score has-score` cards (was 7 before the
+  key rotation).
+- Residual gap: `australia|turkey|2026-06-14T04:00:00Z` (and a stale
+  `haiti|scotland` LIVE row) fall between the old key's death and the new key's
+  `daysFrom=3` scores window, so they cannot be backfilled from The Odds API.
 
 The previous Walrus testnet compact publish from 2026-06-13 13:34 CST remains
 the latest recorded Walrus publish unless a new publish is run manually.
