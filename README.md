@@ -11,6 +11,26 @@ acting elsewhere.
 
 中文简述:这是一个 2026 世界杯赔率与预测市场聚合雷达，强调 Walrus 可验证数据层、AI 辅助分析、赛后复盘和风险纪律；不执行下注、不托管资金、不承诺收益。
 
+## Live Demo / 在线预览
+
+Public demo: **https://crossing-tide-extra-explicit.trycloudflare.com**
+
+Quick links (add `?lang=en` for English):
+
+- [Landing page](https://crossing-tide-extra-explicit.trycloudflare.com/)
+- [Live radar](https://crossing-tide-extra-explicit.trycloudflare.com/radar?lang=zh)
+- [Walrus snapshots](https://crossing-tide-extra-explicit.trycloudflare.com/walrus?lang=zh)
+- [Post-match review](https://crossing-tide-extra-explicit.trycloudflare.com/review?lang=zh)
+- [Opportunities](https://crossing-tide-extra-explicit.trycloudflare.com/opportunities?lang=zh)
+- [Alerts](https://crossing-tide-extra-explicit.trycloudflare.com/alerts?lang=zh)
+
+> This is a temporary Cloudflare quick tunnel for demos, not stable production
+> infrastructure: if the tunnel container is recreated, the URL can change. If the
+> link is down, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for how to fetch the
+> current URL.
+>
+> 中文:以上为临时演示地址(Cloudflare 隧道),可能会变动;失效时见部署文档获取最新地址。
+
 ## What Judges Should See First
 
 - Landing page at `/`: product narrative, live metrics, current match radar, and
@@ -28,8 +48,8 @@ acting elsewhere.
   through the live window, with scorelines and event context when available.
   Winners are marked green, losers red, and draws neutral/amber.
 
-The current demo deployment is a temporary Cloudflare tunnel. See
-[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the latest runbook and URL.
+See [Live Demo](#live-demo--在线预览) above for the public URL, and
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the full deployment runbook.
 
 ## Why It Matters
 
