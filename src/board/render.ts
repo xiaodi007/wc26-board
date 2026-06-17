@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { API_FOOTBALL_KEY, WALRUS_AGGREGATOR_URL, WALRUS_FEED_DIR } from "../config.js";
+import { ALERT_MAX_PER_DAY, API_FOOTBALL_KEY, SERVERCHAN_KEY, WALRUS_FEED_DIR } from "../config.js";
 import { getCompletedOdds, getCurrentOdds, LABELS, type CurrentOddsRow, type Label, type ThreeWay } from "../queries/currentOdds.js";
 import { getLineHistory, type SourceLineHistory } from "../queries/lineHistory.js";
 import { getSportteryEdges, SPORTTERY_EDGE_PP, SPORTTERY_MIN_BOOKS, type SportteryAvoidanceRow } from "../queries/sportteryAvoidance.js";
@@ -8,7 +8,6 @@ import { getOutrightBoard } from "../queries/outright.js";
 import {
   compactMoney,
   compactNumber,
-  formatThreeWayShort,
   getMarketRadar,
   getMatchIntelligence,
   percent,
@@ -19,15 +18,16 @@ import {
   type RiskSignal,
 } from "../queries/marketIntelligence.js";
 import { getProbabilityCandidates, type ProbabilityCandidate, type SourceContribution } from "../queries/probabilityModel.js";
-import { getMatchEventBundle, type MatchEventBundle, type MatchEventRow } from "../queries/matchEvents.js";
+import { getMatchEventBundle, getResultSourceStatuses, type MatchEventBundle, type MatchEventRow, type MatchResultRow, type ResultSourceStatus } from "../queries/matchEvents.js";
 import { getReviewBoard, type ReviewJump, type ReviewMatch, type ReviewQuality } from "../queries/reviewBoard.js";
 import { fmtAge, getSourceFreshness, runHealthChecks } from "../queries/healthChecks.js";
 import { getAllSportteryHhad, getSportteryHhad, type HhadBoardRow } from "../queries/hhad.js";
 import { buildMatchContext } from "../ai/context.js";
 import { aiProviderOptions, currentAiProvider, currentSystemPrompt, hasApiKey, type AnalysisVerdict } from "../ai/analyze.js";
 import { latestBoardVerdict, type BoardBettingVerdict } from "../ai/boardPlan.js";
-import { countAlerts24h, getMeta, listAnalyses, listRecentAlerts, listWalrusPublishLog, type AiAnalysisRow } from "../db.js";
+import { countAlerts24h, getMeta, listAnalyses, listRecentAlerts, listWalrusPublishLog, type AiAnalysisRow, type AlertRow } from "../db.js";
 import { normalizeTeam, zhTeamName } from "../teams.js";
+import { walrusBlobJsonUrl, walrusExplorerUrl } from "../walrusLinks.js";
 import { lineChart, sparkline, type ChartSeries } from "./svg.js";
 import {
   ACTION_LABELS,
@@ -56,7 +56,7 @@ const SOURCE_COLOR: Record<string, string> = {
   pinnacle: "var(--lime)",
   sporttery: "var(--amber)",
 };
-type PageActive = "home" | "opportunities" | "match" | "walrus" | "review";
+type PageActive = "landing" | "home" | "opportunities" | "match" | "walrus" | "review" | "alerts";
 
 function esc(raw: string): string {
   return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -99,8 +99,12 @@ function localizeMatch(locale: Locale, raw: string | undefined): string | undefi
 }
 
 function outcomeName(locale: Locale, row: CurrentOddsRow, label: Label): string {
-  if (label === "home") return team(locale, row.homeTeam);
-  if (label === "away") return team(locale, row.awayTeam);
+  return outcomeNameForTeams(locale, row.homeTeam, row.awayTeam, label);
+}
+
+function outcomeNameForTeams(locale: Locale, homeTeam: string, awayTeam: string, label: Label): string {
+  if (label === "home") return team(locale, homeTeam);
+  if (label === "away") return team(locale, awayTeam);
   return outcomeLabel(locale, "draw");
 }
 
@@ -157,13 +161,13 @@ function sportteryDiffLine(locale: Locale, row: CurrentOddsRow): string {
   if (row.live) return `<div class="sporttery-line"><span class="dim">${locale === "zh" ? "体彩已停售" : "Sporttery closed"}</span></div>`;
   if (!row.sporttery) return `<div class="sporttery-line"><span class="dim">${locale === "zh" ? "体彩未开售/未抓取" : "Sporttery unavailable"}</span></div>`;
   if (!row.bookAvg || row.books < MIN_BOOKS) {
-    return `<div class="sporttery-line"><span class="dim">Sporttery</span>${LABELS.map((label) => `<span>${esc(outcomeName(locale, row, label))} ${pct(row.sporttery![label])}</span>`).join("")}</div>`;
+    return `<div class="sporttery-line"><span class="dim">Sporttery</span>${LABELS.map((label) => `<span class="prob-token ${probLeaderClass(row.sporttery!, label)}">${esc(outcomeName(locale, row, label))} <b>${pct(row.sporttery![label])}</b></span>`).join("")}</div>`;
   }
   return (
     `<div class="sporttery-line"><span class="dim">Sporttery</span>` +
     LABELS.map((label) => {
       const diff = (row.sporttery![label] - row.bookAvg![label]) * 100;
-      return `<span>${esc(outcomeName(locale, row, label))} ${pct(row.sporttery![label])}${diffBadge(locale, diff)}</span>`;
+      return `<span class="prob-token ${probLeaderClass(row.sporttery!, label)}">${esc(outcomeName(locale, row, label))} <b>${pct(row.sporttery![label])}</b>${diffBadge(locale, diff)}</span>`;
     }).join("") +
     `</div>`
   );
@@ -211,9 +215,105 @@ function teamBadge(locale: Locale, name: string, side: "home" | "away"): string 
   return `<div class="team-badge ${side}"><span>${esc(teamToken(name))}</span><b>${esc(team(locale, name))}</b></div>`;
 }
 
+type ResultLookup = (fixtureKey: string) => MatchEventBundle;
+
+function createResultLookup(): ResultLookup {
+  const cache = new Map<string, MatchEventBundle>();
+  return (fixtureKey: string) => {
+    const cached = cache.get(fixtureKey);
+    if (cached) return cached;
+    const bundle = getMatchEventBundle(fixtureKey);
+    cache.set(fixtureKey, bundle);
+    return bundle;
+  };
+}
+
+function scoredResult(bundle: MatchEventBundle): MatchResultRow | null {
+  const result = bundle.result;
+  return result?.homeScore !== null && result?.homeScore !== undefined && result?.awayScore !== null && result?.awayScore !== undefined ? result : null;
+}
+
+function winnerFromResult(result: MatchResultRow | null): Label | null {
+  if (!result || result.homeScore === null || result.awayScore === null) return null;
+  if (result.homeScore > result.awayScore) return "home";
+  if (result.homeScore < result.awayScore) return "away";
+  return "draw";
+}
+
+function resultClass(side: "home" | "away", winner: Label | null): string {
+  if (!winner) return "";
+  if (winner === "draw") return "result-draw";
+  return winner === side ? "result-winner" : "result-loser";
+}
+
+function scoreBadge(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle, variant: "card" | "review" = "card"): string {
+  const result = scoredResult(bundle);
+  if (!result) return "";
+  const winner = winnerFromResult(result);
+  const home = team(locale, row.homeTeam);
+  const away = team(locale, row.awayTeam);
+  const meta = `${resultStatusLabel(locale, result.status)} · ${resultSourceLabel(locale, result.source)}`;
+  const side = (label: "home" | "away", name: string, score: number | null): string =>
+    `<div class="score-side ${resultClass(label, winner)}"><span>${esc(name)}</span><b>${score ?? "-"}</b></div>`;
+  return (
+    `<div class="result-score ${variant === "review" ? "rv-card-score has-score" : "card-result-score"}" title="${esc(meta)}">` +
+    side("home", home, result.homeScore) +
+    side("away", away, result.awayScore) +
+    `<small>${esc(meta)}</small>` +
+    `</div>`
+  );
+}
+
+function heroScore(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle): string {
+  const result = scoredResult(bundle);
+  if (!result) return "";
+  const winner = winnerFromResult(result);
+  return (
+    `<div class="countdown match-result-center">` +
+    `<span class="dim">${esc(resultStatusLabel(locale, result.status))}</span>` +
+    `<strong><b class="${resultClass("home", winner)}">${result.homeScore}</b><em>-</em><b class="${resultClass("away", winner)}">${result.awayScore}</b></strong>` +
+    `<small>${esc(resultSourceLabel(locale, result.source))}</small>` +
+    `</div>`
+  );
+}
+
+function probabilityLeaders(probs: ThreeWay): Set<Label> {
+  const max = Math.max(...LABELS.map((label) => probs[label]).filter((value) => Number.isFinite(value)));
+  return new Set(LABELS.filter((label) => Number.isFinite(probs[label]) && Math.abs(probs[label] - max) < 0.000001));
+}
+
+function probLeaderClass(probs: ThreeWay, label: Label): string {
+  return probabilityLeaders(probs).has(label) ? "prob-leader" : "";
+}
+
+function probabilityRow(locale: Locale, row: CurrentOddsRow, probs: ThreeWay, extra = ""): string {
+  return (
+    `<div class="prob-row">` +
+    LABELS.map((label) => `<span class="prob-token ${probLeaderClass(probs, label)}">${esc(outcomeName(locale, row, label))} <b>${pct(probs[label])}</b></span>`).join("") +
+    extra +
+    `</div>`
+  );
+}
+
+function probabilityCell(probs: ThreeWay, label: Label, content: string): string {
+  return `<td class="num ${probLeaderClass(probs, label)}">${content}</td>`;
+}
+
+function compactProbability(locale: Locale, row: CurrentOddsRow, probs: ThreeWay): string {
+  return compactProbabilityForTeams(locale, row.homeTeam, row.awayTeam, probs);
+}
+
+function compactProbabilityForTeams(locale: Locale, homeTeam: string, awayTeam: string, probs: ThreeWay): string {
+  return (
+    `<span class="threeway-inline">` +
+    LABELS.map((label) => `<span class="prob-token ${probLeaderClass(probs, label)}">${esc(outcomeNameForTeams(locale, homeTeam, awayTeam, label))} <b>${pct(probs[label], 0)}</b></span>`).join("") +
+    `</span>`
+  );
+}
+
 function consensusBar(locale: Locale, row: CurrentOddsRow, probs: ThreeWay): string {
   const seg = (label: Label): string =>
-    `<div style="width:${(probs[label] * 100).toFixed(1)}%;background:${LABEL_COLOR[label]}" title="${esc(outcomeName(locale, row, label))} ${pct(probs[label])}"></div>`;
+    `<div class="${probLeaderClass(probs, label)}" style="width:${(probs[label] * 100).toFixed(1)}%;background:${LABEL_COLOR[label]}" title="${esc(outcomeName(locale, row, label))} ${pct(probs[label])}"></div>`;
   return `<div class="prob-bar">${seg("home")}${seg("draw")}${seg("away")}</div>`;
 }
 
@@ -398,16 +498,28 @@ function resultStatusLabel(locale: Locale, status: string | null): string {
   return map[status] ?? status;
 }
 
+function resultSourceLabel(locale: Locale, source: string | null | undefined): string {
+  if (source === "api_football") return "API-Football";
+  if (source === "sporttery_results") return locale === "zh" ? "体彩赛果" : "Sporttery scores";
+  if (source === "oddsapi") return "The Odds API scores";
+  return locale === "zh" ? "赛果源" : "Score source";
+}
+
+function anyResultSourceAttempted(bundle: MatchEventBundle): boolean {
+  return Object.values(bundle.configured.sources).some((source) => source.available);
+}
+
 function reviewScoreboard(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle): string {
-  const result = bundle.result;
+  const result = scoredResult(bundle);
   const home = team(locale, row.homeTeam);
   const away = team(locale, row.awayTeam);
-  if (result?.homeScore !== null && result?.homeScore !== undefined && result?.awayScore !== null && result?.awayScore !== undefined) {
+  if (result) {
+    const winner = winnerFromResult(result);
     return (
       `<div class="review-scoreboard">` +
-      `<div><span>${esc(home)}</span><b>${result.homeScore}</b></div>` +
-      `<strong>${esc(resultStatusLabel(locale, result.status))}</strong>` +
-      `<div><span>${esc(away)}</span><b>${result.awayScore}</b></div>` +
+      `<div class="${resultClass("home", winner)}"><span>${esc(home)}</span><b>${result.homeScore}</b></div>` +
+      `<strong>${esc(resultStatusLabel(locale, result.status))}<span class="score-source">${esc(resultSourceLabel(locale, result.source))}</span></strong>` +
+      `<div class="${resultClass("away", winner)}"><span>${esc(away)}</span><b>${result.awayScore}</b></div>` +
       `</div>`
     );
   }
@@ -415,9 +527,13 @@ function reviewScoreboard(locale: Locale, row: CurrentOddsRow, bundle: MatchEven
     ? locale === "zh"
       ? "赛果源已配置，但这场暂未匹配到比分；先展示赔率复盘。"
       : "Result source is configured, but this match has not been matched yet; showing odds review only."
+    : anyResultSourceAttempted(bundle)
+      ? locale === "zh"
+        ? "赛果来源已跑过，但这场暂未匹配到比分；当前先做赔率复盘。"
+        : "Score sources have run, but this match has not been matched yet; showing odds review only."
     : locale === "zh"
-      ? "未配置 API_FOOTBALL_KEY，当前只能做赔率复盘。"
-      : "API_FOOTBALL_KEY is not configured, so this is odds review only.";
+      ? "体彩/赔率比分采集尚未成功跑完，当前先做赔率复盘。"
+      : "Sporttery/Odds score collection has not completed yet, so this is odds review only.";
   return `<div class="review-scoreboard empty"><div><span>${esc(home)}</span><b>-</b></div><strong>${esc(gap)}</strong><div><span>${esc(away)}</span><b>-</b></div></div>`;
 }
 
@@ -442,15 +558,15 @@ function reviewTimeline(locale: Locale, row: CurrentOddsRow, bundle: MatchEventB
   if (!bundle.events.length) {
     const text = bundle.result
       ? locale === "zh"
-        ? "已拿到比分，但当前来源不提供进球事件；接入 API-Football 后会显示时间轴。"
-        : "Score is available, but this source does not provide goal events. API-Football will add the timeline."
+        ? `已拿到${resultSourceLabel(locale, bundle.result.source)}比分，但当前来源不提供进球事件；接入 API-Football 后会显示时间轴。`
+        : `Score is available from ${resultSourceLabel(locale, bundle.result.source)}, but this source does not provide goal events. API-Football will add the timeline.`
       : API_FOOTBALL_KEY
         ? locale === "zh"
           ? "这场暂未匹配到进球事件。"
           : "No matched event timeline for this match yet."
         : locale === "zh"
-          ? "未配置 API_FOOTBALL_KEY，暂无进球时间轴。"
-          : "API_FOOTBALL_KEY is not configured, so no goal timeline is available.";
+          ? "未配置 API_FOOTBALL_KEY，体彩/赔率源只补比分，暂无进球时间轴。"
+          : "API_FOOTBALL_KEY is not configured; Sporttery/Odds sources can add score only, not a goal timeline.";
     return `<div class="event-timeline empty">${esc(text)}</div>`;
   }
   const shown = bundle.events.filter((event) => isGoalEvent(event) || ["Card", "subst", "Var"].includes(event.eventType ?? "")).slice(0, 18);
@@ -467,8 +583,7 @@ function reviewTimeline(locale: Locale, row: CurrentOddsRow, bundle: MatchEventB
   );
 }
 
-function matchEventsPanel(locale: Locale, row: CurrentOddsRow): string {
-  const bundle = getMatchEventBundle(row.fixtureKey);
+function matchEventsPanel(locale: Locale, row: CurrentOddsRow, bundle: MatchEventBundle = getMatchEventBundle(row.fixtureKey)): string {
   if (!bundle.result && !bundle.events.length && !row.live && Date.parse(row.kickoffUtc) > Date.now()) return "";
   return (
     `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "比分与事件" : "Score & Events"}</h2><a href="/api/match-events?fk=${encodeURIComponent(row.fixtureKey)}">JSON</a></div>` +
@@ -504,9 +619,11 @@ function walrusProof(locale: Locale): string {
   const error = getMeta("walrus_latest_error");
   const status = error ? t.labels.syncDelayed : blob ? t.labels.latest : t.labels.notPublished;
   const badge = error ? "watch" : blob ? "low" : "mute";
+  const jsonHref = walrusBlobJsonUrl(blob);
+  const explorerHref = walrusExplorerUrl(blob, network);
   return (
     `<section class="panel proof-panel">` +
-    `<div class="panel-head"><h2>${esc(t.sections.walrusProof)}</h2><span class="badge ${badge}">${esc(status)}</span></div>` +
+    `<div class="panel-head"><h2>${esc(t.sections.walrusProof)}</h2><div class="mini"><span class="badge ${badge}">${esc(status)}</span>${jsonHref ? `<a class="btn" href="${esc(jsonHref)}">${locale === "zh" ? "打开 JSON" : "Open JSON"}</a>` : ""}${explorerHref ? `<a class="btn" href="${esc(explorerHref)}">${locale === "zh" ? "Walrus 浏览器" : "Walruscan"}</a>` : ""}</div></div>` +
     `<div class="proof-grid">` +
     `<div><span>${esc(t.labels.network)}</span><b>${esc(network)}</b></div>` +
     `<div><span>${esc(t.labels.schema)}</span><b>${esc(schema)}</b></div>` +
@@ -525,12 +642,13 @@ function latestBettingSummary(locale: Locale, verdict: BoardBettingVerdict | nul
   if (!verdict) {
     return `<div class="plan-empty">${locale === "zh" ? "还没有生成投注计划。填入本金、最大日亏损和临时 API key 后，可以直接生成；也可以先复制 prompt 到外部 AI。" : "No betting plan yet. Add bankroll, max daily loss, and a temporary API key, or copy the prompt."}</div>`;
   }
+  const summary = verdict.summary || (verdict as BoardBettingVerdict & { summary_zh?: string }).summary_zh || "";
   const picks = verdict.recommendations
     .slice(0, 3)
     .map((pick) => `<span class="chip ok">${esc(pick.outcome.toUpperCase())} <b>${pct(pick.estimated_probability)}</b></span>`)
     .join("");
   return (
-    `<p class="hero-sub">${esc(verdict.summary)}</p>` +
+    `<p class="hero-sub">${esc(summary)}</p>` +
     `<div class="mini" style="margin-top:8px">${picks || `<span class="chip">${locale === "zh" ? "暂无正 EV 建议" : "No positive-EV picks"}</span>`}</div>` +
     `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
     `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`
@@ -545,8 +663,9 @@ function latestBettingCardSummary(locale: Locale, verdict: BoardBettingVerdict |
     );
   }
   const picks = verdict.recommendations.length;
+  const summary = verdict.summary || (verdict as BoardBettingVerdict & { summary_zh?: string }).summary_zh || "";
   return (
-    `<p class="hero-sub">${esc(verdict.summary || (locale === "zh" ? "已有计划，打开查看详情。" : "A plan is available. Open it for details."))}</p>` +
+    `<p class="hero-sub">${esc(summary || (locale === "zh" ? "已有计划，打开查看详情。" : "A plan is available. Open it for details."))}</p>` +
     `<div class="mini" style="margin-top:8px"><span class="chip ok">${locale === "zh" ? "推荐" : "Picks"} <b>${picks}</b></span><span class="chip">${locale === "zh" ? "观察" : "Watch"} <b>${verdict.watchlist.length}</b></span><span class="chip">${locale === "zh" ? "避开" : "Avoid"} <b>${verdict.avoid.length}</b></span></div>` +
     `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
     `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`
@@ -554,7 +673,7 @@ function latestBettingCardSummary(locale: Locale, verdict: BoardBettingVerdict |
 }
 
 function bettingPlanPanel(locale: Locale, model: ReturnType<typeof getMarketRadar>, fixtureKey?: string): string {
-  const latest = latestBoardVerdict();
+  const latest = latestBoardVerdict(locale, fixtureKey ?? null);
   const latestVerdict = latest?.verdict ?? null;
   const provider = currentAiProvider();
   const providerMeta = aiProviderOptions();
@@ -746,6 +865,10 @@ function readableVerdict(data){
   if(!bets.length) return ${JSON.stringify(locale === "zh" ? "今天不建议下注：没有方向同时满足正 EV、赔率和风险门槛。" : "No bet recommended: no direction clears EV, price, and risk thresholds.")};
   return ${JSON.stringify(locale === "zh" ? "当前建议 " : "Recommended ")}+bets.length+${JSON.stringify(locale === "zh" ? " 注，总金额 " : " bets, total stake ")}+planMoney(s.totalStake)+${JSON.stringify(locale === "zh" ? "，最坏亏损 " : ", worst loss ")}+planMoney(s.worstCaseLoss)+"。";
 }
+function planSummaryText(data){
+  var v=data && data.verdict ? data.verdict : {};
+  return v.summary || v.summary_zh || "";
+}
 function betCard(r){
   var match=window.__matchNames[r.fixture_key] || r.fixture_key;
   return "<div class='plan-bet-card'><div><div class='opp-title'>${locale === "zh" ? "买 " : "Buy "}"+h(planOutcome(r))+" · "+h(match)+"</div><p class='opp-note'>"+h(r.offeredOdd.platform)+" · ${locale === "zh" ? "赔率" : "odds"} "+Number(r.offeredOdd.decimalOdds).toFixed(3)+" · ${locale === "zh" ? "建议金额" : "stake"} <b>"+planMoney(r.stake)+"</b> · ${locale === "zh" ? "最大亏损" : "max loss"} "+planMoney(r.maxLoss)+" · EV "+planMoney(r.expectedValue)+"</p><p class='opp-note'>"+h(r.reason||"")+"</p><div class='muted-line'>${locale === "zh" ? "撤销条件" : "Cancel if"}: "+h(r.cancel_if||"-")+"</div><div class='muted-line'>${locale === "zh" ? "风险" : "Risk"}: "+h(r.risk||"-")+"</div></div><div class='plan-numbers'><span>${locale === "zh" ? "模型概率" : "Model p"} <b>"+planPct(r.estimated_probability)+"</b></span><span>${locale === "zh" ? "市场概率" : "Market p"} <b>"+planPct(r.marketImpliedProbability)+"</b></span><span>Edge <b class='"+(r.edgePp>=0?"pos":"neg")+"'>"+planSignedPp(r.edgePp)+"</b></span><span>EV/stake <b>"+planPct(r.evPctStake)+"</b></span></div></div>";
@@ -768,7 +891,7 @@ function renderPlan(data, opts){
   var formula="<details class='details-panel'><summary>${locale === "zh" ? "公式细节" : "Formula details"}</summary><p class='opp-note'>${locale === "zh" ? "Kelly fraction = 25% × raw Kelly；单注上限 = 本金 1%；总下注受最大日亏损限制。EV = stake × (model_probability × decimal_odds - 1)。这里只是个人研究，不保证收益。" : "Kelly fraction = 25% × raw Kelly; max stake per pick = 1% of bankroll; total stake is capped by max daily loss. EV = stake × (model_probability × decimal_odds − 1). Personal research only, no profit guarantee."}</p></details>";
   var summary="<div class='plan-summary'><div><span>${locale === "zh" ? "总下注" : "Total stake"}</span><b>"+planMoney(s.totalStake)+"</b></div><div><span>${locale === "zh" ? "最坏亏损" : "Worst loss"}</span><b>"+planMoney(s.worstCaseLoss)+"</b></div><div><span>${locale === "zh" ? "全中净收益" : "All-win profit"}</span><b>"+planMoney(s.allWinNetProfit)+"</b></div><div><span>${locale === "zh" ? "期望收益" : "Expected value"}</span><b>"+planMoney(s.expectedValue)+"</b></div><div><span>${locale === "zh" ? "预计亏损概率" : "Approx. loss prob."}</span><b>"+(s.approximateLossProbability===null?"-":planPct(s.approximateLossProbability))+"</b></div></div>";
   var betHtml=bets.length ? bets.map(betCard).join("") : "<div class='plan-empty'>${locale === "zh" ? "当前没有达到正 EV + 2pp 门槛的下注建议。" : "No pick cleared the positive-EV + 2pp threshold."}</div>";
-  planOutput("<div class='plan-verdict'>"+h(readableVerdict(data))+"</div>"+planSourceLine(data,opts)+"<p class='hero-sub'>"+h(data.verdict.summary_zh||"")+"</p>"+summary+"<div class='plan-bucket good'><h3>${locale === "zh" ? "可以买" : "Can buy"}</h3>"+betHtml+"</div><div class='plan-bucket watch'><h3>${locale === "zh" ? "先观察" : "Watch first"}</h3>"+planItemRows(watch,'watch')+"</div><div class='plan-bucket avoid'><h3>${locale === "zh" ? "别买 / 避坑" : "Avoid"}</h3>"+planItemRows(avoid,'avoid')+"</div>"+formula);
+  planOutput("<div class='plan-verdict'>"+h(readableVerdict(data))+"</div>"+planSourceLine(data,opts)+"<p class='hero-sub'>"+h(planSummaryText(data))+"</p>"+summary+"<div class='plan-bucket good'><h3>${locale === "zh" ? "可以买" : "Can buy"}</h3>"+betHtml+"</div><div class='plan-bucket watch'><h3>${locale === "zh" ? "先观察" : "Watch first"}</h3>"+planItemRows(watch,'watch')+"</div><div class='plan-bucket avoid'><h3>${locale === "zh" ? "别买 / 避坑" : "Avoid"}</h3>"+planItemRows(avoid,'avoid')+"</div>"+formula);
   var card=document.getElementById("plan-card-copy");
   if(card){
     card.innerHTML="<p class='hero-sub'>"+h(readableVerdict(data))+"</p><div class='mini' style='margin-top:8px'><span class='chip ok'>${locale === "zh" ? "可以买" : "Buy"} <b>"+bets.length+"</b></span><span class='chip'>${locale === "zh" ? "观察" : "Watch"} <b>"+watch.length+"</b></span><span class='chip'>${locale === "zh" ? "避开" : "Avoid"} <b>"+avoid.length+"</b></span></div><div class='muted-line'>${locale === "zh" ? "资金纪律" : "Bankroll"}: "+h(data.verdict.bankroll_note||"-")+"</div><div class='muted-line'>${locale === "zh" ? "数据质量" : "Data quality"}: "+h(data.verdict.data_quality||"-")+"</div>";
@@ -878,11 +1001,11 @@ function sidebar(locale: Locale, active: PageActive): string {
     `<aside class="sidebar">` +
     `<a class="brand" href="${href("/", locale)}"><span class="brand-mark">W</span><div><strong>${esc(t.appName)}</strong><small>${esc(t.appSub)}</small></div></a>` +
     `<nav class="side-nav">` +
-    item("radar", href("/", locale), "⌘", active === "home") +
+    item("radar", href("/radar", locale), "⌘", active === "home") +
     item("opportunities", href("/opportunities", locale), "◇", active === "opportunities") +
     item("review", href("/review", locale), "↺", active === "review") +
     item("walrus", href("/walrus", locale), "W", active === "walrus") +
-    item("alerts", `${href("/", locale)}#alerts`, "◌") +
+    item("alerts", href("/alerts", locale), "◌", active === "alerts") +
     item("api", "/api/radar", "↗") +
     `</nav>` +
     `<div class="side-card"><b>${esc(t.worldCup)}</b><span>2026.06.11 - 07.19</span><small>${esc(t.freeTier)}</small></div>` +
@@ -894,7 +1017,7 @@ function topbar(
   locale: Locale,
   active: PageActive,
   model = getMarketRadar(),
-  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : active === "alerts" ? "/alerts" : active === "home" ? "/radar" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   const t = COPY[locale];
@@ -909,7 +1032,7 @@ function topbar(
     `<input name="q" list="match-list" placeholder="${esc(t.search)}" autocomplete="off">` +
     `<input type="hidden" name="fk"><input type="hidden" name="lang" value="${locale}"><datalist id="match-list">${options}</datalist>` +
     `</form>` +
-    `<div class="top-actions">${freshnessChips(locale)}<a class="lang-pill" href="${href(switchPath, other, switchParams)}">${esc(LOCALE_NAME[other])}</a><a class="lang-pill" href="${active === "match" ? "#ai" : "#brief"}">${esc(t.aiBrief)}</a></div>` +
+    `<div class="top-actions">${freshnessChips(locale)}<a class="lang-pill" href="${href(switchPath, other, switchParams)}">${esc(LOCALE_NAME[other])}</a><a class="lang-pill" href="${active === "match" ? "#ai" : active === "home" ? "#brief" : `${href("/radar", locale)}#brief`}">${esc(t.aiBrief)}</a></div>` +
     `<script>
 function goMatchSearch(form){
   var q=(form.q.value||"").toLowerCase();
@@ -930,7 +1053,7 @@ function page(
   body: string,
   model = getMarketRadar(),
   autoRefreshSec = 60,
-  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : "/",
+  switchPath = active === "opportunities" ? "/opportunities" : active === "walrus" ? "/walrus" : active === "review" ? "/review" : active === "alerts" ? "/alerts" : active === "home" ? "/radar" : "/",
   switchParams: Record<string, string> = {}
 ): string {
   return `<!doctype html>
@@ -957,32 +1080,41 @@ a{color:inherit;text-decoration:none}
 .hero-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(340px,.55fr);gap:14px;margin-top:16px;min-width:0}.bento{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;min-width:0}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span12{grid-column:span 12}
 .panel,.card,.metric-card{min-width:0;background:linear-gradient(180deg,rgba(15,28,47,.88),rgba(8,18,31,.84));border:1px solid var(--line);border-radius:8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 22px 60px rgba(0,0,0,.24)}.panel{padding:14px}.card{display:block;padding:13px}.card:hover{border-color:var(--line2);transform:translateY(-1px);transition:transform .16s ease,border-color .16s ease}
 .hero-title{font-size:34px;line-height:1.08;font-weight:820;margin:0 0 8px}.hero-sub{color:var(--dim);margin:0;max-width:820px}.mini{display:flex;gap:9px;align-items:center;flex-wrap:wrap;color:var(--dim);font-size:12px}.muted-line{margin-top:8px;color:var(--muted);font-size:12px}.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.landing-hero{margin-top:16px;min-height:560px;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:18px;align-items:center;padding:20px;border:1px solid var(--line);border-radius:8px;background:linear-gradient(135deg,rgba(67,199,255,.13),rgba(154,230,110,.06) 42%,rgba(244,189,80,.08)),linear-gradient(180deg,rgba(12,25,41,.95),rgba(4,11,20,.93));box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 30px 90px rgba(0,0,0,.32)}
+.landing-kicker{display:inline-flex;align-items:center;gap:7px;margin-bottom:10px;color:var(--cyan);font-size:11px;font-weight:760;text-transform:uppercase;letter-spacing:.08em}.landing-kicker:before{content:"";width:22px;height:2px;background:var(--cyan)}
+.landing-title{max-width:820px;font-size:46px;line-height:1.02;font-weight:900;margin:0 0 12px}.landing-copy{max-width:790px;color:#c4d4e6;font-size:15px;margin:0}
+.landing-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:18px}.landing-actions .btn{height:36px;display:inline-flex;align-items:center}.landing-actions .primary{background:rgba(154,230,110,.18);border-color:rgba(154,230,110,.42)}
+.landing-caution{margin-top:13px;color:var(--dim);font-size:12px;max-width:740px}.landing-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:18px}.landing-stat{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.30);padding:9px}.landing-stat span{display:block;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.landing-stat b{display:block;margin-top:4px;font:850 19px/1.1 var(--mono)}
+.landing-visual{display:grid;gap:10px}.landing-screen{border:1px solid var(--line2);border-radius:8px;background:rgba(3,10,18,.62);padding:10px;box-shadow:0 24px 70px rgba(0,0,0,.30)}.landing-screen-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.landing-screen-title{font-weight:800}.landing-match{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;padding:8px 0;border-top:1px solid var(--line)}.landing-match:first-of-type{border-top:0}.landing-match-name{font-weight:720}.landing-match-meta{color:var(--dim);font-size:11px;margin-top:2px}.landing-match-score{display:grid;justify-items:end;gap:4px}.landing-match-score b{font:850 18px/1 var(--mono)}.landing-match-score span{color:var(--dim);font-size:10px;text-transform:uppercase}.landing-match .card-result-score{margin:0;min-width:132px;max-width:180px}.landing-match .card-result-score small{display:none}
+.landing-flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.landing-flow div{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:8px;font-size:12px}.landing-flow span{display:block;color:var(--cyan);font:850 14px/1 var(--mono);margin-bottom:5px}.landing-feature-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.landing-feature{border:1px solid var(--line);border-radius:8px;background:rgba(13,25,42,.55);padding:14px}.landing-feature h2{font-size:15px;margin-bottom:6px}.landing-feature p{margin:0;color:var(--dim);font-size:12px;line-height:1.55}
 .metric-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin:14px 0}.metric-card{min-height:84px;padding:12px}.metric-card .label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}.metric-card .value{font-family:var(--mono);font-size:22px;line-height:1.2;margin-top:8px}.metric-card .hint{font-size:11px;color:var(--muted);margin-top:4px}
 .priority-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(330px,.7fr);gap:14px;margin-top:16px}.dayhead{margin:12px 0 8px;color:var(--dim);font-size:12px}.priority-list{display:grid;gap:10px}.priority-card{padding:11px}.sporttery-line{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim)}.brief-panel .brief-item{padding:10px 0}.brief-panel .brief-item:first-of-type{padding-top:0}.brief-panel .brief-tag{display:inline-block;margin-top:2px}.edge-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compact-table td,.compact-table th{padding:6px 8px}.details-panel{margin-top:10px}.btn{height:32px;border:1px solid var(--line);background:rgba(14,24,39,.72);color:var(--text);border-radius:8px;padding:0 12px;font-size:12px;cursor:pointer}.btn.primary{background:rgba(67,199,255,.22);border-color:var(--line2);color:#fff;font-weight:750}.btn:disabled{opacity:.55;cursor:wait}textarea.prompt-box,pre.prompt-box{width:100%;background:rgba(5,12,22,.72);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:12px/1.45 var(--mono);white-space:pre-wrap}textarea.prompt-box{min-height:150px;resize:vertical}pre.prompt-box{max-height:280px;overflow:auto}.analysis-card{margin-bottom:10px}.analysis-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.value-map{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:8px}.value-map div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}
 .plan-panel{margin-top:16px}.plan-card-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.plan-card-actions{display:grid;gap:8px;justify-items:end;min-width:150px}.plan-modal-backdrop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(2,8,16,.72);backdrop-filter:blur(14px)}.plan-modal-backdrop[hidden]{display:none}.plan-modal{width:min(1120px,100%);max-height:calc(100vh - 40px);overflow:hidden;border:1px solid var(--line2);border-radius:8px;background:linear-gradient(180deg,rgba(13,25,42,.98),rgba(6,14,25,.98));box-shadow:0 28px 90px rgba(0,0,0,.5)}.plan-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}.plan-modal-head h2{margin-top:0}.plan-modal-body{max-height:calc(100vh - 132px);overflow:auto;padding:14px 16px}.icon-btn{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(14,24,39,.72);color:var(--text);cursor:pointer;font-weight:800}.icon-btn:hover{border-color:var(--line2)}.plan-config{display:grid;grid-template-columns:repeat(7,minmax(112px,1fr));gap:9px;margin-top:4px}.plan-config.compact-config{grid-template-columns:repeat(2,minmax(150px,1fr));margin:8px 0 0}.plan-config label{display:grid;gap:4px;color:var(--dim);font-size:11px}.plan-config input,.plan-config select{height:34px;min-width:0;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 9px}.switch-row{height:34px;display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.54);padding:0 9px;color:var(--text)}.switch-row input{width:15px;height:15px;padding:0}.plan-advanced{margin-top:8px}.plan-advanced summary{color:var(--dim);font-size:12px;cursor:pointer}.plan-progress{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid rgba(244,189,80,.28);background:rgba(244,189,80,.09);border-radius:8px;padding:10px 12px;margin:10px 0;color:var(--amber)}.plan-progress[hidden]{display:none}.plan-progress span{color:var(--dim);font-size:12px}.plan-verdict{border:1px solid rgba(154,230,110,.22);background:rgba(154,230,110,.08);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-weight:760}.plan-summary{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin:10px 0}.plan-summary div,.plan-empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.26);padding:10px}.plan-error pre{white-space:pre-wrap;margin:8px 0 0;color:var(--dim);font:12px/1.45 var(--mono)}.plan-summary span{display:block;color:var(--dim);font-size:11px}.plan-summary b{display:block;font-family:var(--mono);font-size:18px;margin-top:3px}.plan-section{margin-top:10px}.plan-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.28fr);gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.plan-row:last-child{border-bottom:0}.plan-bucket{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}.plan-bucket h3{margin:0 0 8px;font-size:14px}.plan-bucket.good h3{color:var(--lime)}.plan-bucket.watch h3{color:var(--amber)}.plan-bucket.avoid h3{color:var(--red)}.plan-bet-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(210px,.28fr);gap:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.22);margin-bottom:8px}.plan-lite-row{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:rgba(5,12,22,.18);margin-bottom:7px}.plan-lite-row p{margin:4px 0;color:var(--dim);font-size:12px}.plan-lite-row span{color:var(--muted);font-size:12px}.plan-numbers{display:grid;gap:5px;align-content:start}.plan-numbers span{display:flex;justify-content:space-between;gap:8px;color:var(--dim);font-size:12px}.plan-numbers b{color:var(--text);font-family:var(--mono)}.plan-small{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
 .section-head,.panel-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:22px 0 10px}.panel-head{margin:0 0 10px}h2{font-size:16px;margin:0}h2 small{color:var(--dim);font-weight:400;margin-left:8px}.section-head a{font-size:12px;color:var(--cyan)}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}.card-head{display:flex;align-items:center;gap:10px;margin-bottom:9px}.teams{font-weight:750;font-size:15px;flex:1}.ko{font-size:12px;color:var(--dim)}.ko-stack{display:grid;gap:3px;min-width:86px}.ko-date{font-size:11px;color:var(--dim);white-space:nowrap}.count-pill{display:inline-flex;align-items:center;justify-content:center;min-height:20px;border:1px solid rgba(67,199,255,.24);border-radius:999px;padding:1px 7px;color:var(--cyan);background:rgba(67,199,255,.08);font:700 11px/1.2 var(--mono)}.live{color:#fff;background:rgba(231,102,117,.82);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:800}
-.prob-bar{display:flex;height:10px;overflow:hidden;border-radius:999px;background:rgba(149,174,205,.14);margin:8px 0}.prob-row{display:flex;gap:12px;color:var(--dim);font-size:12px;min-width:0}.prob-row b{color:var(--text)}.spark{margin-left:auto;min-width:0}.spark svg{display:block;max-width:100%;height:auto}
+.prob-bar{display:flex;height:10px;overflow:hidden;border-radius:999px;background:rgba(149,174,205,.14);margin:8px 0}.prob-bar .prob-leader{box-shadow:inset 0 0 0 2px rgba(238,246,255,.78);filter:saturate(1.18)}.prob-row{display:flex;gap:8px;color:var(--dim);font-size:12px;min-width:0}.prob-row b{color:var(--text)}.threeway-inline{display:inline-flex;justify-content:flex-end;gap:4px;flex-wrap:wrap}.prob-token{display:inline-flex;align-items:center;gap:4px;min-height:22px;border:1px solid transparent;border-radius:999px;padding:1px 6px}.prob-token.prob-leader,td.prob-leader{background:rgba(154,230,110,.10);color:var(--text);border-color:rgba(154,230,110,.24)}.prob-token.prob-leader b,td.prob-leader{color:var(--lime)}.spark{margin-left:auto;min-width:0}.spark svg{display:block;max-width:100%;height:auto}
+.funding-strip{display:grid;gap:5px;margin:7px 0 9px;padding:8px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.20)}.funding-strip.empty{min-height:42px;align-content:center;color:var(--dim);font-size:12px}.funding-head,.funding-legend{display:flex;align-items:center;justify-content:space-between;gap:8px}.funding-head span{color:var(--dim);font-size:11px}.funding-head b{font-family:var(--mono);font-size:12px}.funding-bar{display:flex;height:8px;overflow:hidden;border-radius:999px;background:rgba(149,174,205,.13)}.funding-bar i{display:block;min-width:0}.funding-bar i.home{background:var(--cyan)}.funding-bar i.draw{background:var(--amber)}.funding-bar i.away{background:var(--violet)}.funding-legend{justify-content:flex-start;flex-wrap:wrap;color:var(--dim);font-size:11px}.funding-legend b{color:var(--text);font-weight:650}.funding-legend em{font-style:normal;color:var(--muted)}
 .badge{display:inline-flex;align-items:center;min-height:19px;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:750;border:1px solid transparent;margin-right:4px}.badge.bad{background:rgba(231,102,117,.15);color:var(--red);border-color:rgba(231,102,117,.18)}.badge.watch{background:rgba(244,189,80,.12);color:var(--amber);border-color:rgba(244,189,80,.20)}.badge.low{background:rgba(154,230,110,.11);color:var(--lime);border-color:rgba(154,230,110,.18)}.badge.info{background:rgba(67,199,255,.11);color:var(--cyan);border-color:rgba(67,199,255,.18)}.badge.mute{background:rgba(149,174,205,.10);color:var(--dim);border-color:rgba(149,174,205,.16)}
 .score-ring{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:850;background:conic-gradient(var(--cyan) calc(var(--score)*1%),rgba(149,174,205,.14) 0);position:relative;flex:0 0 auto}.score-ring:before{content:"";position:absolute;inset:5px;border-radius:50%;background:var(--panel2)}.score-ring span{position:relative}
+.result-score{display:grid;gap:4px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);padding:7px 9px}.card-result-score{margin:0 0 9px}.score-side{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;color:var(--dim)}.score-side span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:700}.score-side b{font:900 16px/1 var(--mono);color:var(--text)}.result-winner,.result-winner span,.result-winner b{color:var(--lime)}.result-loser,.result-loser span,.result-loser b{color:var(--red)}.result-draw,.result-draw span,.result-draw b{color:var(--amber)}.result-score small{color:var(--dim);font-size:10px;line-height:1.2;font-weight:700}.match-result-center strong{display:flex;align-items:center;justify-content:center;gap:8px}.match-result-center strong b{font:900 32px/1 var(--mono)}.match-result-center strong em{font-style:normal;color:var(--dim)}.match-result-center small{display:block;color:var(--dim);font-size:10px;font-weight:700}
 .source-diffs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0;color:var(--dim);font-size:11px}.source-diff{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:2px 6px;background:rgba(5,12,22,.22)}.source-diff b{color:var(--text);font-size:10px}.source-diff em{font-style:normal;font-family:var(--mono);font-size:10px}
 .opp-row{display:grid;grid-template-columns:1.7fr .68fr .72fr .7fr .78fr .8fr .74fr .92fr;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}.opp-row:last-child{border-bottom:0}.probability-row{grid-template-columns:1.9fr .58fr .58fr .58fr .62fr .62fr .56fr}.opp-title{font-weight:760}.opp-note{font-size:12px;color:var(--dim);margin-top:4px}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px 9px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:550;font-size:12px}td.num,th.num{text-align:right}.dim{color:var(--dim)}.pos{color:var(--lime)}.neg{color:var(--red)}
 .brief-item{padding:9px;border-bottom:1px solid var(--line);position:relative}.brief-item:last-child{border-bottom:0}.brief-item p{margin:4px 0;color:var(--dim);font-size:12px}.brief-tag{font-size:11px;color:var(--cyan)}
 .proof-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.proof-grid div{border:1px solid var(--line);border-radius:7px;padding:9px;background:rgba(5,12,22,.28)}.proof-grid span{display:block;color:var(--dim);font-size:11px}.proof-grid b{display:block;margin-top:4px;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis}.proof-blob{grid-column:1/-1}
-.match-hero{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding:18px;background:linear-gradient(135deg,rgba(67,199,255,.09),rgba(139,124,246,.09)),linear-gradient(180deg,rgba(15,28,47,.9),rgba(8,18,31,.86));border:1px solid var(--line);border-radius:8px}.team-badge{display:flex;align-items:center;gap:12px}.team-badge.away{justify-content:flex-end}.team-badge span{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:900;border:1px solid var(--line2);background:rgba(67,199,255,.10);color:var(--text)}.team-badge.away span{background:rgba(139,124,246,.12)}.team-badge b{font-size:20px}.countdown{text-align:center}.countdown strong{display:block;font-family:var(--mono);font-size:25px}.meta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:10px}.meta-grid div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}.meta-grid span{display:block;color:var(--dim);font-size:11px}.meta-grid b{display:block;margin-top:3px;font-size:12px}.review-scoreboard{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;border:1px solid var(--line2);border-radius:8px;background:rgba(67,199,255,.07);padding:12px;margin-bottom:10px}.review-scoreboard div{display:flex;align-items:baseline;gap:10px}.review-scoreboard div:last-child{justify-content:flex-end}.review-scoreboard span{color:var(--dim)}.review-scoreboard b{font:900 34px/1 var(--mono)}.review-scoreboard strong{color:var(--cyan);font-size:12px;text-align:center}.review-scoreboard.empty strong{max-width:520px;color:var(--dim);font-weight:550}.event-timeline{display:grid;gap:7px}.event-timeline.empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px;color:var(--dim)}.event-item{display:grid;grid-template-columns:58px 46px minmax(0,1fr);gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.18);padding:8px}.event-item.goal{border-color:rgba(244,189,80,.30);background:rgba(244,189,80,.07)}.event-item b{font-family:var(--mono);color:var(--amber)}.event-item p{margin:0;color:var(--dim);font-size:12px}
+.match-hero{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding:18px;background:linear-gradient(135deg,rgba(67,199,255,.09),rgba(139,124,246,.09)),linear-gradient(180deg,rgba(15,28,47,.9),rgba(8,18,31,.86));border:1px solid var(--line);border-radius:8px}.team-badge{display:flex;align-items:center;gap:12px}.team-badge.away{justify-content:flex-end}.team-badge span{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-weight:900;border:1px solid var(--line2);background:rgba(67,199,255,.10);color:var(--text)}.team-badge.away span{background:rgba(139,124,246,.12)}.team-badge b{font-size:20px}.countdown{text-align:center}.countdown strong{display:block;font-family:var(--mono);font-size:25px}.meta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:10px}.meta-grid div{border:1px solid var(--line);border-radius:7px;padding:8px;background:rgba(5,12,22,.24)}.meta-grid span{display:block;color:var(--dim);font-size:11px}.meta-grid b{display:block;margin-top:3px;font-size:12px}.review-scoreboard{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;border:1px solid var(--line2);border-radius:8px;background:rgba(67,199,255,.07);padding:12px;margin-bottom:10px}.review-scoreboard div{display:flex;align-items:baseline;gap:10px}.review-scoreboard div:last-child{justify-content:flex-end}.review-scoreboard span{color:var(--dim)}.review-scoreboard b{font:900 34px/1 var(--mono)}.review-scoreboard strong{display:grid;justify-items:center;color:var(--cyan);font-size:12px;text-align:center}.review-scoreboard .score-source{margin-top:3px;color:var(--dim);font-size:10px;font-weight:650}.review-scoreboard .result-winner span,.review-scoreboard .result-winner b{color:var(--lime)}.review-scoreboard .result-loser span,.review-scoreboard .result-loser b{color:var(--red)}.review-scoreboard .result-draw span,.review-scoreboard .result-draw b{color:var(--amber)}.review-scoreboard.empty strong{max-width:520px;color:var(--dim);font-weight:550}.event-timeline{display:grid;gap:7px}.event-timeline.empty{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px;color:var(--dim)}.event-item{display:grid;grid-template-columns:58px 46px minmax(0,1fr);gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.18);padding:8px}.event-item.goal{border-color:rgba(244,189,80,.30);background:rgba(244,189,80,.07)}.event-item b{font-family:var(--mono);color:var(--amber)}.event-item p{margin:0;color:var(--dim);font-size:12px}
 .review-controls{margin-top:14px;display:grid;gap:10px}.review-controls .rv-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.review-controls .rv-label{color:var(--dim);font-size:12px;min-width:42px}.review-controls .rv-chips{display:flex;gap:6px;flex-wrap:wrap}.review-controls .chip{cursor:pointer}.chip.active{background:rgba(67,199,255,.18);border-color:var(--line2);color:#fff}.rv-sort-label{margin-left:auto;color:var(--dim);font-size:12px;display:flex;align-items:center;gap:6px}.rv-sort-label select{height:30px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 8px}#rv-search{flex:1;min-width:200px;height:32px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 10px}
-.review-card{border:1px solid var(--line);border-radius:8px;background:var(--panel)}.review-card>summary{list-style:none;cursor:pointer;padding:13px 15px;display:grid;gap:8px}.review-card>summary::-webkit-details-marker{display:none}.review-card[open]>summary{border-bottom:1px solid var(--line)}.rv-card-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rv-card-top .rv-title{font-weight:750;font-size:15px}.rv-card-score{margin-left:auto;font-family:var(--mono);font-weight:800;font-size:16px}.rv-card-metrics{display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:12px}.rv-card-metrics b{color:var(--text);font-family:var(--mono)}.rv-card-summary-line{color:var(--dim);font-size:12px}.review-detail{padding:13px 15px;display:grid;gap:13px}.review-detail .rv-h3{margin:0 0 8px;font-size:13px;color:var(--text)}.rv-three{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.rv-three>div{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px}.rv-three span{display:block;color:var(--cyan);font-size:11px;margin-bottom:5px}.rv-three p{margin:0;color:var(--dim);font-size:12px;line-height:1.55}.reaction-table .yes{color:var(--lime)}.reaction-table .no{color:var(--red)}.rv-trend{display:grid;gap:8px}.rv-trend-bar{display:flex;gap:14px;flex-wrap:wrap}.rv-toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}.rv-toggle button{background:transparent;border:0;color:var(--dim);font-size:12px;padding:5px 10px;cursor:pointer;border-right:1px solid var(--line)}.rv-toggle button:last-child{border-right:0}.rv-toggle button.active{background:rgba(67,199,255,.18);color:#fff}
+.review-card{min-width:0;max-width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:var(--panel)}.review-card>summary{min-width:0;list-style:none;cursor:pointer;padding:13px 15px;display:grid;gap:8px}.review-card>summary::-webkit-details-marker{display:none}.review-card[open]>summary{border-bottom:1px solid var(--line)}.rv-card-top{min-width:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rv-card-top .rv-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:750;font-size:15px}.rv-card-score{margin-left:auto;min-width:126px;display:grid;justify-items:stretch;gap:4px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);text-align:right}.rv-card-score>b{font:900 23px/1 var(--mono);color:var(--text)}.rv-card-score small{font-size:10px;line-height:1.2;color:var(--dim);font-weight:700;text-align:right}.rv-card-score.has-score{min-width:172px;border-color:rgba(67,199,255,.28);background:rgba(67,199,255,.08)}.rv-card-score.pending b{font-size:15px;color:var(--dim)}.rv-card-metrics{min-width:0;display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:12px}.rv-card-metrics b{color:var(--text);font-family:var(--mono)}.rv-card-summary-line{min-width:0;color:var(--dim);font-size:12px}.review-detail{min-width:0;padding:13px 15px;display:grid;gap:13px}.review-detail .rv-h3{margin:0 0 8px;font-size:13px;color:var(--text)}.rv-three{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.rv-three>div{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.24);padding:10px}.rv-three span{display:block;color:var(--cyan);font-size:11px;margin-bottom:5px}.rv-three p{margin:0;color:var(--dim);font-size:12px;line-height:1.55}.reaction-table .yes{color:var(--lime)}.reaction-table .no{color:var(--red)}.rv-trend{display:grid;gap:8px}.rv-trend-bar{display:flex;gap:14px;flex-wrap:wrap}.rv-toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}.rv-toggle button{background:transparent;border:0;color:var(--dim);font-size:12px;padding:5px 10px;cursor:pointer;border-right:1px solid var(--line)}.rv-toggle button:last-child{border-right:0}.rv-toggle button.active{background:rgba(67,199,255,.18);color:#fff}
 .opp-controls{margin-top:14px;display:grid;gap:10px}.opp-controls .rv-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.opp-controls .rv-label{color:var(--dim);font-size:12px;min-width:42px}.opp-controls .rv-chips{display:flex;gap:6px;flex-wrap:wrap}.opp-controls .chip{cursor:pointer}#op-search{flex:1;min-width:200px;height:32px;border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.78);color:var(--text);padding:0 10px}
 .opp-card{display:grid;grid-template-columns:64px minmax(170px,1.25fr) minmax(200px,1fr) minmax(190px,.95fr) auto;gap:16px;align-items:center;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.opp-c-score{display:grid;justify-items:center;gap:4px}.opp-c-score span{font-size:10px;color:var(--dim)}.opp-c-title{font-weight:750;font-size:16px}.opp-c-id .opp-note{margin-top:3px}.opp-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.opp-ai{margin-top:7px;color:var(--dim);font-size:12px;line-height:1.5}.opp-price-line{display:flex;align-items:center;gap:8px}.opp-price{font:800 18px/1 var(--mono)}.opp-spark{margin-left:auto}.opp-bar{display:grid;gap:5px;margin-top:9px}.opp-bar .bar-row{display:grid;grid-template-columns:52px 1fr 46px;align-items:center;gap:7px;font-size:11px;color:var(--dim)}.opp-bar .bar-track{height:6px;border-radius:999px;background:rgba(149,174,205,.16);overflow:hidden}.opp-bar .bar-fill{height:100%}.opp-bar .bar-row b{font-family:var(--mono);color:var(--text);text-align:right}.opp-bar .bar-foot{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--dim);margin-top:3px}.opp-bar .bar-foot b{font-family:var(--mono)}.opp-metrics{display:grid;grid-template-columns:repeat(3,auto);gap:8px 16px;font-size:11px;color:var(--dim)}.opp-metrics b{display:block;color:var(--text);font-family:var(--mono);font-size:12px;margin-top:2px}.opp-c-act{display:grid;gap:8px;justify-items:end;align-content:center}.opp-action{font-size:11px;color:var(--cyan)}
 @media(max-width:980px){.opp-card{grid-template-columns:56px minmax(0,1fr)}.opp-c-mid,.opp-c-metrics,.opp-c-act{grid-column:1/-1}.opp-c-act{justify-items:start}}
-@media(max-width:760px){.rv-three{grid-template-columns:1fr}.rv-sort-label{margin-left:0;width:100%}}
+@media(max-width:760px){.rv-three{grid-template-columns:1fr}.rv-sort-label{margin-left:0;width:100%}.rv-card-top{display:grid;grid-template-columns:minmax(0,1fr)}.rv-card-score,.rv-card-score.has-score{width:100%;min-width:0;margin-left:0;justify-items:stretch;text-align:left}.rv-card-score small{text-align:left}}
 .risk-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.risk-item{border:1px solid var(--line);border-radius:8px;background:rgba(5,12,22,.28);padding:10px}.risk-item .r-title{font-size:12px;color:var(--dim)}.risk-item .r-value{font-family:var(--mono);font-size:20px;margin:5px 0}
 .chart-grid{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:12px}.chart-cell{min-width:0;overflow:hidden}.chart-cell svg{display:block;width:100%;height:auto;max-width:100%}.chart-title{font-size:12px;color:var(--dim);margin-bottom:4px}.legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin:4px 0 10px;flex-wrap:wrap}.legend i{display:inline-block;width:14px;height:3px;margin-right:4px;vertical-align:middle}
 footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
-@media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid{grid-template-columns:minmax(0,1fr)}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.plan-config{grid-template-columns:repeat(3,minmax(0,1fr))}.plan-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.match-hero,.review-scoreboard{grid-template-columns:1fr;text-align:left}.team-badge.away,.review-scoreboard div:last-child{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row,.plan-bet-card{grid-template-columns:1fr}.plan-progress{display:grid}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}.event-item{grid-template-columns:50px 42px minmax(0,1fr)}}
-@media (max-width:520px){.metric-strip{grid-template-columns:1fr}.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}}
+@media (max-width:1180px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;min-width:0;max-width:100vw}.brand{flex:0 0 auto}.side-nav{flex:1 1 auto;min-width:0;overflow-x:auto;flex-direction:row}.side-nav a{flex:0 0 auto}.side-card{display:none}.workspace{padding:0 14px 48px}.metric-strip{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}.hero-grid,.bento,.priority-grid,.landing-hero{grid-template-columns:minmax(0,1fr)}.landing-hero{min-height:auto}.landing-feature-grid,.landing-flow{grid-template-columns:repeat(2,minmax(0,1fr))}.span4,.span5,.span6,.span7,.span8,.span12{grid-column:span 1}.topbar{flex-wrap:wrap}.top-actions{width:100%;overflow-x:auto}.chart-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}.plan-config{grid-template-columns:repeat(3,minmax(0,1fr))}.plan-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:760px){.cards{grid-template-columns:1fr}.metric-strip,.landing-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.ai-prob-strip{grid-template-columns:1fr!important}.opp-row{grid-template-columns:1fr}.match-hero,.review-scoreboard{grid-template-columns:1fr;text-align:left}.team-badge.away,.review-scoreboard div:last-child{justify-content:flex-start}.countdown{text-align:left}.risk-grid,.proof-grid,.edge-grid,.analysis-grid,.value-map,.plan-card-grid,.plan-config,.plan-summary,.plan-row,.plan-bet-card,.landing-feature-grid,.landing-flow{grid-template-columns:1fr}.landing-visual{display:none}.landing-hero{padding:10px}.landing-title{font-size:30px}.landing-actions{gap:8px;margin-top:14px}.landing-actions .btn{width:calc(50% - 4px);justify-content:center;padding:0 8px}.landing-caution{margin-top:10px}.landing-stats{margin-top:12px}.plan-progress{display:grid}.plan-card-actions{justify-items:start}.plan-modal-backdrop{align-items:stretch;padding:10px}.plan-modal{max-height:calc(100vh - 20px)}.plan-modal-body{max-height:calc(100vh - 112px)}table{display:block;overflow-x:auto;white-space:nowrap;max-width:100%}.hero-title{font-size:27px}.search{min-width:100%;max-width:none}.top-actions{overflow:visible;flex-wrap:wrap;gap:6px}.prob-row{flex-wrap:wrap}.spark{width:100%;margin-left:0}.event-item{grid-template-columns:50px 42px minmax(0,1fr)}}
+@media (max-width:520px){.workspace{padding-left:12px;padding-right:12px}.top-actions{padding-bottom:2px}.chip,.lang-pill{height:30px;padding:0 8px}.team-badge span{width:48px;height:48px}.team-badge b{font-size:18px}.landing-title{font-size:28px}}
 </style>
 </head>
 <body>
@@ -1033,18 +1165,21 @@ ${body}
 </html>`;
 }
 
-function insightCard(locale: Locale, match: MatchIntelligence): string {
+function insightCard(locale: Locale, match: MatchIntelligence, resultLookup: ResultLookup = getMatchEventBundle): string {
   const row = match.row;
   const t = COPY[locale];
   const consensus = row.bookAvg ?? row.polymarket ?? row.kalshi ?? row.pinnacle;
   const kickoff = new Date(row.kickoffUtc);
   const ko = row.live ? `<span class="live">${esc(t.labels.live)}</span>` : `<span class="ko">${esc(clock(locale, kickoff))}</span>`;
   const probRow = consensus
-    ? `<div class="prob-row">${LABELS.map((label) => `<span>${esc(outcomeName(locale, row, label))} <b>${pct(consensus[label])}</b></span>`).join("")}<span class="spark">${cardSpark(locale, row)}</span></div>`
+    ? probabilityRow(locale, row, consensus, `<span class="spark">${cardSpark(locale, row)}</span>`)
     : `<div class="dim">${esc(t.labels.insufficient)}</div>`;
+  const resultScore = scoreBadge(locale, row, resultLookup(row.fixtureKey));
   return (
     `<a class="card" href="${href("/match", locale, { fk: row.fixtureKey })}">` +
     `<div class="card-head">${ko}<span class="teams">${esc(matchNameFromRow(locale, row))}</span>${scoreRing(match.heatScore, "heat")}</div>` +
+    resultScore +
+    matchFundingDistribution(locale, match) +
     (consensus ? consensusBar(locale, row, consensus) + probRow : probRow) +
     `<div class="mini"><span>PM liquidity <b class="mono">${compactMoney(match.pmLiquidity)}</b></span><span>24h active traders <b class="mono">${compactNumber(match.pmActiveTraders24h)}</b>${match.sampled ? ` <span class="badge mute">${esc(t.labels.sampled)}</span>` : ""}</span><span>spread <b class="mono">${percent(match.pmAvgSpread, 1)}</b></span>${riskBadge(locale, match.riskLevel)}</div>` +
     `<div class="opp-note">${esc(explainMarket(locale, match.aiExplanation))}</div>` +
@@ -1104,11 +1239,15 @@ function riskPanel(locale: Locale, signals: RiskSignal[]): string {
 
 function marketMetricsTable(locale: Locale, match: MatchIntelligence): string {
   const t = COPY[locale];
+  const lastPrices = LABELS.map((label) => match.pmMarkets[label]?.lastTradePrice).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const maxLast = lastPrices.length ? Math.max(...lastPrices) : null;
   const rows = LABELS.map((label) => {
     const metric = match.pmMarkets[label];
+    const leader = metric?.lastTradePrice !== undefined && metric.lastTradePrice !== null && maxLast !== null && Math.abs(metric.lastTradePrice - maxLast) < 0.000001;
+    const leaderClass = leader ? "prob-leader" : "";
     return (
-      `<tr><td>${esc(outcomeName(locale, match.row, label))}</td>` +
-      `<td class="num">${metric ? pct(metric.lastTradePrice) : "-"}</td>` +
+      `<tr><td class="${leaderClass}">${esc(outcomeName(locale, match.row, label))}</td>` +
+      `<td class="num ${leaderClass}">${metric ? pct(metric.lastTradePrice) : "-"}</td>` +
       `<td class="num">${compactMoney(metric?.liquidity)}</td>` +
       `<td class="num">${compactMoney(metric?.volume24h)}</td>` +
       `<td class="num">${percent(metric?.spread, 1)}</td>` +
@@ -1120,6 +1259,28 @@ function marketMetricsTable(locale: Locale, match: MatchIntelligence): string {
   return `<table><tr><th>PM market</th><th class="num">Last</th><th class="num">PM liquidity</th><th class="num">Volume 24h</th><th class="num">Spread</th><th class="num">Active traders 24h</th><th class="num">Top holder depth</th><th class="num">Top holder conc.</th></tr>${rows}</table>`;
 }
 
+function matchFundingDistribution(locale: Locale, match: MatchIntelligence): string {
+  const volumeValues = LABELS.map((label) => match.pmMarkets[label]?.volume24h ?? null);
+  const liquidityValues = LABELS.map((label) => match.pmMarkets[label]?.liquidity ?? null);
+  const hasVolume = volumeValues.some((value) => typeof value === "number" && value > 0);
+  const basis = hasVolume ? "volume" : "liquidity";
+  const values = (hasVolume ? volumeValues : liquidityValues).map((value) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0));
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const title = basis === "volume" ? (locale === "zh" ? "PM 24h 资金分布" : "PM 24h funding") : locale === "zh" ? "PM 流动性分布" : "PM liquidity split";
+  if (total <= 0) {
+    return `<div class="funding-strip empty"><span>${locale === "zh" ? "PM 资金分布不可用" : "PM funding unavailable"}</span></div>`;
+  }
+  const segments = LABELS.map((label, i) => {
+    const share = values[i] / total;
+    return `<i class="${label}" style="width:${Math.max(share * 100, values[i] > 0 ? 3 : 0).toFixed(1)}%" title="${esc(outcomeName(locale, match.row, label))} ${pct(share, 0)}"></i>`;
+  }).join("");
+  const legend = LABELS.map((label, i) => {
+    const share = values[i] / total;
+    return `<span><b>${esc(outcomeName(locale, match.row, label))}</b> ${pct(share, 0)} <em>${esc(compactMoney(values[i]))}</em></span>`;
+  }).join("");
+  return `<div class="funding-strip"><div class="funding-head"><span>${esc(title)}</span><b>${esc(compactMoney(total))}</b></div><div class="funding-bar">${segments}</div><div class="funding-legend">${legend}</div></div>`;
+}
+
 function sourceTable(locale: Locale, row: CurrentOddsRow): string {
   const order = ["polymarket", "kalshi", "pinnacle", "sporttery"];
   const entries = Object.entries(row.sourceOdds).sort((a, b) => {
@@ -1128,31 +1289,34 @@ function sourceTable(locale: Locale, row: CurrentOddsRow): string {
     return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a[0].localeCompare(b[0]);
   });
   const diffCell = (label: Label, probs: ThreeWay): string => {
-    if (!row.bookAvg) return `<td class="num">${pct(probs[label])}</td>`;
+    if (!row.bookAvg) return probabilityCell(probs, label, pct(probs[label]));
     const diff = (probs[label] - row.bookAvg[label]) * 100;
     const cls = diff >= 2 ? "neg" : diff <= -2 ? "pos" : "dim";
-    return `<td class="num">${pct(probs[label])} <span class="${cls}" style="font-size:11px">${signedPp(diff)}</span></td>`;
+    return probabilityCell(probs, label, `${pct(probs[label])} <span class="${cls}" style="font-size:11px">${signedPp(diff)}</span>`);
   };
   const avgRow = row.bookAvg
-    ? `<tr style="font-weight:650"><td>${locale === "zh" ? "书商中位" : "Book median"} (${row.books})</td>${LABELS.map((label) => `<td class="num">${pct(row.bookAvg![label])}</td>`).join("")}</tr>`
+    ? `<tr style="font-weight:650"><td>${locale === "zh" ? "书商中位" : "Book median"} (${row.books})</td>${LABELS.map((label) => probabilityCell(row.bookAvg!, label, pct(row.bookAvg![label]))).join("")}</tr>`
     : "";
   return `<table><tr><th>${locale === "zh" ? "平台" : "Platform"}</th>${LABELS.map((label) => `<th class="num">${esc(outcomeName(locale, row, label))}</th>`).join("")}</tr>${avgRow}${entries
     .map(([source, probs]) => `<tr><td>${esc(source)}</td>${LABELS.map((label) => diffCell(label, probs)).join("")}</tr>`)
     .join("")}</table>`;
 }
 
-function priorityMatchCard(locale: Locale, match: MatchIntelligence): string {
+function priorityMatchCard(locale: Locale, match: MatchIntelligence, resultLookup: ResultLookup = getMatchEventBundle): string {
   const row = match.row;
   const t = COPY[locale];
   const consensus = row.bookAvg ?? row.polymarket ?? row.kalshi ?? row.pinnacle;
   const kickoff = new Date(row.kickoffUtc);
   const ko = matchTimePill(locale, row, kickoff);
   const probRow = consensus
-    ? `<div class="prob-row">${LABELS.map((label) => `<span>${esc(outcomeName(locale, row, label))} <b>${pct(consensus[label])}</b></span>`).join("")}<span class="spark">${cardSpark(locale, row)}</span></div>`
+    ? probabilityRow(locale, row, consensus, `<span class="spark">${cardSpark(locale, row)}</span>`)
     : `<div class="dim">${esc(t.labels.insufficient)}</div>`;
+  const resultScore = scoreBadge(locale, row, resultLookup(row.fixtureKey));
   return (
     `<a class="card priority-card" href="${href("/match", locale, { fk: row.fixtureKey })}">` +
     `<div class="card-head">${ko}<span class="teams">${esc(matchNameFromRow(locale, row))}</span>${scoreRing(match.heatScore, "heat")}</div>` +
+    resultScore +
+    matchFundingDistribution(locale, match) +
     (consensus ? consensusBar(locale, row, consensus) + probRow : probRow) +
     (sourceDiffStrip(locale, row) || sportteryDiffLine(locale, row)) +
     `<div class="mini"><span>PM liq <b class="mono">${compactMoney(match.pmLiquidity)}</b></span><span>24h traders <b class="mono">${compactNumber(match.pmActiveTraders24h)}</b>${match.sampled ? ` <span class="badge mute">${esc(t.labels.sampled)}</span>` : ""}</span><span>${esc(t.labels.gap)} <b class="mono">${match.maxDivergencePp.toFixed(1)}pp</b></span>${riskBadge(locale, match.riskLevel)}</div>` +
@@ -1195,7 +1359,7 @@ function sourceDiffStrip(locale: Locale, row: CurrentOddsRow): string {
   return items ? `<div class="source-diffs"><span class="dim">${locale === "zh" ? "相对书商中位" : "vs book median"}</span>${items}</div>` : "";
 }
 
-function priorityMatches(locale: Locale, matches: MatchIntelligence[]): string {
+function priorityMatches(locale: Locale, matches: MatchIntelligence[], resultLookup: ResultLookup = getMatchEventBundle): string {
   const now = Date.now();
   const horizon = now + CARD_WINDOW_H * 3600_000;
   const live = matches.filter((m) => m.row.live);
@@ -1207,15 +1371,15 @@ function priorityMatches(locale: Locale, matches: MatchIntelligence[]): string {
     groups.set(key, [...(groups.get(key) ?? []), match]);
   }
   const liveHtml = live.length
-    ? `<div class="dayhead" style="color:var(--red);font-weight:750">${locale === "zh" ? "进行中 · 盘中概率" : "Live in-play odds"}</div><div class="priority-list">${live.map((m) => priorityMatchCard(locale, m)).join("")}</div>`
+    ? `<div class="dayhead" style="color:var(--red);font-weight:750">${locale === "zh" ? "进行中 · 盘中概率" : "Live in-play odds"}</div><div class="priority-list">${live.map((m) => priorityMatchCard(locale, m, resultLookup)).join("")}</div>`
     : "";
   const nearHtml = [...groups.entries()]
-    .map(([day, rows]) => `<div class="dayhead">${esc(day)}</div><div class="priority-list">${rows.map((m) => priorityMatchCard(locale, m)).join("")}</div>`)
+    .map(([day, rows]) => `<div class="dayhead">${esc(day)}</div><div class="priority-list">${rows.map((m) => priorityMatchCard(locale, m, resultLookup)).join("")}</div>`)
     .join("") || `<p class="dim">${locale === "zh" ? "48 小时内没有待开赛比赛。" : "No upcoming matches within 48h."}</p>`;
   const farHtml = far.length
     ? `<details class="details-panel"><summary>${locale === "zh" ? `更远的比赛 ${far.length} 场` : `${far.length} later matches`}</summary><div class="panel" style="margin-top:8px"><table class="compact-table"><tr><th>${locale === "zh" ? "开球" : "Kickoff"}</th><th>${locale === "zh" ? "比赛" : "Match"}</th><th class="num">${locale === "zh" ? "共识" : "Consensus"}</th></tr>${far
         .slice(0, 24)
-        .map((m) => `<tr><td>${esc(fullTime(locale, new Date(m.row.kickoffUtc)))}</td><td><a href="${href("/match", locale, { fk: m.row.fixtureKey })}">${esc(matchNameFromRow(locale, m.row))}</a></td><td class="num">${esc(formatThreeWayShort(m.row.bookAvg))}</td></tr>`)
+        .map((m) => `<tr><td>${esc(fullTime(locale, new Date(m.row.kickoffUtc)))}</td><td><a href="${href("/match", locale, { fk: m.row.fixtureKey })}">${esc(matchNameFromRow(locale, m.row))}</a></td><td class="num">${m.row.bookAvg ? compactProbability(locale, m.row, m.row.bookAvg) : "-"}</td></tr>`)
         .join("")}</table></div></details>`
     : "";
   return liveHtml + nearHtml + farHtml;
@@ -1316,7 +1480,7 @@ function hhadBoardPanel(locale: Locale): string {
   const tr = (r: HhadBoardRow): string =>
     `<tr><td>${esc(fullTime(locale, new Date(r.kickoffUtc)))}</td><td><a href="${href("/match", locale, { fk: r.fixtureKey })}">${esc(matchName(locale, r.homeTeam, r.awayTeam))}</a></td>` +
     `<td>${esc(hhadLineDesc(locale, r.goalLine, r.homeTeam))}</td><td class="num">${LABELS.map((label) => (r.sp[label] !== null ? r.sp[label]!.toFixed(2) : "-")).join(" / ")}</td>` +
-    `<td class="num">${r.probs ? LABELS.map((label) => pct(r.probs![label])).join(" / ") : "-"}</td><td class="dim">${r.sourceUpdatedTs ? esc(fullTime(locale, new Date(r.sourceUpdatedTs))) : "-"}</td></tr>`;
+    `<td class="num">${r.probs ? compactProbabilityForTeams(locale, r.homeTeam, r.awayTeam, r.probs) : "-"}</td><td class="dim">${r.sourceUpdatedTs ? esc(fullTime(locale, new Date(r.sourceUpdatedTs))) : "-"}</td></tr>`;
   const header = `<tr><th>${locale === "zh" ? "开球" : "Kickoff"}</th><th>${locale === "zh" ? "比赛" : "Match"}</th><th>${locale === "zh" ? "盘口" : "Line"}</th><th class="num">SP</th><th class="num">${locale === "zh" ? "归一隐含" : "Normalized"}</th><th>${locale === "zh" ? "更新" : "Updated"}</th></tr>`;
   const rest = rows.slice(10);
   return (
@@ -1342,37 +1506,42 @@ function outrightPanel(locale: Locale): string {
   return `<section class="span6"><div class="section-head"><h2>${locale === "zh" ? "夺冠概率 Top 10" : "Outright Top 10"}<small>PM/Kalshi</small></h2></div><div class="panel"><table class="compact-table"><tr><th>${locale === "zh" ? "球队" : "Team"}</th><th class="num">PM</th><th class="num">Δ24h</th><th class="num">Kalshi</th><th class="num">Δ24h</th><th class="num">Gap</th></tr>${body}</table></div></section>`;
 }
 
+function localizedAlertTitle(locale: Locale, title: string): string {
+  if (locale === "zh") return title;
+  const jump = title.match(/^盘口突变\s+(.+?)\s+vs\s+(.+?)\((.+?)\):\s+(.+?)\s+([+-].*)$/);
+  if (jump) {
+    const [, home, away, state, outcome, rest] = jump;
+    const stateLabel = state === "进行中" ? "live" : state;
+    const outcomeLabelText = outcome === "主胜" ? "Home" : outcome === "客胜" ? "Away" : outcome === "平" ? "Draw" : outcome;
+    return `Line move ${team(locale, home)} vs ${team(locale, away)} (${stateLabel}): ${outcomeLabelText} ${rest}`;
+  }
+  const edge = title.match(/^体彩(避坑|划算)\s+(.+?)\s+vs\s+(.+?)\s+(.+?):\s+体彩\s+(.+?)\s+vs\s+共识\s+(.+)$/);
+  if (edge) {
+    const [, dir, home, away, outcome, sptPct, consPct] = edge;
+    const dirLabel = dir === "避坑" ? "avoid" : "value";
+    const outcomeLabelText = outcome === "平" ? "Draw" : team(locale, outcome);
+    return `Sporttery ${dirLabel} ${team(locale, home)} vs ${team(locale, away)} ${outcomeLabelText}: Sporttery ${sptPct} vs consensus ${consPct}`;
+  }
+  return title
+    .replaceAll("盘口突变", "Line move")
+    .replaceAll("体彩", "Sporttery")
+    .replaceAll("共识", "consensus")
+    .replaceAll("书商", "Books")
+    .replaceAll("进行中", "live")
+    .replaceAll("主胜", "Home")
+    .replaceAll("客胜", "Away")
+    .replaceAll("平", "Draw");
+}
+
+function alertLine(locale: Locale, alert: AlertRow): string {
+  return `<div class="muted-line"><span class="mono">${esc(fullTime(locale, new Date(`${alert.ts}Z`)))}</span> <span class="badge mute">${esc(alert.kind)}</span> ${esc(localizedAlertTitle(locale, alert.title))}</div>`;
+}
+
 function alertsPanel(locale: Locale): string {
   const recent = listRecentAlerts(10);
   if (!recent.length) return "";
-  const alertTitle = (title: string): string => {
-    if (locale === "zh") return title;
-    const jump = title.match(/^盘口突变\s+(.+?)\s+vs\s+(.+?)\((.+?)\):\s+(.+?)\s+([+-].*)$/);
-    if (jump) {
-      const [, home, away, state, outcome, rest] = jump;
-      const stateLabel = state === "进行中" ? "live" : state;
-      const outcomeLabelText = outcome === "主胜" ? "Home" : outcome === "客胜" ? "Away" : outcome === "平" ? "Draw" : outcome;
-      return `Line move ${team(locale, home)} vs ${team(locale, away)} (${stateLabel}): ${outcomeLabelText} ${rest}`;
-    }
-    const edge = title.match(/^体彩(避坑|划算)\s+(.+?)\s+vs\s+(.+?)\s+(.+?):\s+体彩\s+(.+?)\s+vs\s+共识\s+(.+)$/);
-    if (edge) {
-      const [, dir, home, away, outcome, sptPct, consPct] = edge;
-      const dirLabel = dir === "避坑" ? "avoid" : "value";
-      const outcomeLabelText = outcome === "平" ? "Draw" : team(locale, outcome);
-      return `Sporttery ${dirLabel} ${team(locale, home)} vs ${team(locale, away)} ${outcomeLabelText}: Sporttery ${sptPct} vs consensus ${consPct}`;
-    }
-    return title
-      .replaceAll("盘口突变", "Line move")
-      .replaceAll("体彩", "Sporttery")
-      .replaceAll("共识", "consensus")
-      .replaceAll("书商", "Books")
-      .replaceAll("进行中", "live")
-      .replaceAll("主胜", "Home")
-      .replaceAll("客胜", "Away")
-      .replaceAll("平", "Draw");
-  };
   const items = recent
-    .map((alert) => `<div class="muted-line"><span class="mono">${esc(fullTime(locale, new Date(`${alert.ts}Z`)))}</span> <span class="badge mute">${esc(alert.kind)}</span> ${esc(alertTitle(alert.title))}</div>`)
+    .map((alert) => alertLine(locale, alert))
     .join("");
   return `<section class="span6" id="alerts"><div class="section-head"><h2>${locale === "zh" ? "最近告警" : "Recent Alerts"}<small>24h ${countAlerts24h()}</small></h2></div><div class="panel">${items}</div></section>`;
 }
@@ -1410,8 +1579,72 @@ function briefPanel(locale: Locale, model: ReturnType<typeof getMarketRadar>, ro
   );
 }
 
+function landingStat(label: string, value: string): string {
+  return `<div class="landing-stat"><span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+}
+
+function landingMatchRows(locale: Locale, matches: MatchIntelligence[], resultLookup: ResultLookup = getMatchEventBundle): string {
+  const rows = matches.slice(0, 4);
+  if (!rows.length) return `<p class="dim">${locale === "zh" ? "市场数据采集中。" : "Market data is still being collected."}</p>`;
+  return rows
+    .map((match) => {
+      const row = match.row;
+      const consensus = row.bookAvg ?? row.polymarket ?? row.kalshi ?? row.pinnacle;
+      const line = consensus ? compactProbability(locale, row, consensus) : esc(COPY[locale].labels.insufficient);
+      const resultScore = scoreBadge(locale, row, resultLookup(row.fixtureKey));
+      return (
+        `<a class="landing-match" href="${href("/match", locale, { fk: row.fixtureKey })}">` +
+        `<div><div class="landing-match-name">${esc(matchNameFromRow(locale, row))}</div>` +
+        `<div class="landing-match-meta">${esc(fullTime(locale, new Date(row.kickoffUtc)))} CST · ${line} · ${esc(compactMoney(match.pmLiquidity))} PM liq</div></div>` +
+        (resultScore || `<div class="landing-match-score"><b>${Math.round(match.heatScore)}</b><span>heat</span></div>`) +
+        `</a>`
+      );
+    })
+    .join("");
+}
+
+function landingFeature(title: string, body: string): string {
+  return `<div class="landing-feature"><h2>${esc(title)}</h2><p>${esc(body)}</p></div>`;
+}
+
+export function landingPage(locale: Locale = "en"): string {
+  const model = getMarketRadar(70);
+  const resultLookup = createResultLookup();
+  const t = COPY[locale];
+  const l = t.landing;
+  const m = model.metrics;
+  const walrusBlob = getMeta("walrus_latest_manifest_blob_id");
+  const walrusStatus = walrusBlob ? (locale === "zh" ? "已发布" : "published") : (locale === "zh" ? "待发布" : "pending");
+  const stats = [
+    landingStat(locale === "zh" ? "市场" : "markets", compactNumber(m.totalMarkets)),
+    landingStat(locale === "zh" ? "PM 流动性" : "PM liquidity", compactMoney(m.pmLiquidity)),
+    landingStat(locale === "zh" ? "24h 交易者" : "24h traders", compactNumber(m.pmActiveTraders24h)),
+    landingStat(locale === "zh" ? "机会" : "opportunities", compactNumber(m.aiOpportunityCount)),
+  ].join("");
+  const features = [
+    landingFeature(l.liveTitle, l.liveBody),
+    landingFeature(l.aiTitle, l.aiBody),
+    landingFeature(l.walrusTitle, l.walrusBody),
+    landingFeature(l.reviewTitle, l.reviewBody),
+  ].join("");
+  const demoSteps = l.demoSteps.map((step, index) => `<div><span>${String(index + 1).padStart(2, "0")}</span>${esc(step)}</div>`).join("");
+  const body =
+    `<section class="landing-hero">` +
+    `<div><div class="landing-kicker">${esc(l.eyebrow)}</div><h1 class="landing-title">${esc(l.title)}</h1><p class="landing-copy">${esc(l.subtitle)}</p>` +
+    `<div class="landing-actions"><a class="btn primary" href="${href("/radar", locale)}">${esc(l.primaryCta)}</a><a class="btn" href="${href("/walrus", locale)}">${esc(l.secondaryCta)}</a><a class="btn" href="${href("/opportunities", locale)}">${esc(l.proofCta)}</a><a class="btn" href="${href("/review", locale)}">${esc(l.reviewCta)}</a></div>` +
+    `<div class="landing-caution">${esc(l.caution)}</div><div class="landing-stats">${stats}</div></div>` +
+    `<div class="landing-visual"><div class="landing-screen"><div class="landing-screen-head"><div><div class="landing-screen-title">${esc(l.liveTitle)}</div><div class="muted-line">Walrus ${esc(walrusStatus)} · schema wc26.market_radar.v1</div></div><span class="badge low">${esc(t.freeTier)}</span></div>${landingMatchRows(locale, model.matches, resultLookup)}</div>` +
+    `<div class="landing-flow">${demoSteps}</div></div>` +
+    `</section>` +
+    `<section class="panel" style="margin-top:16px"><div class="panel-head"><h2>${esc(l.featureTitle)}</h2><a href="${href("/radar", locale)}">${esc(l.primaryCta)} →</a></div><p class="hero-sub">${esc(l.featureCopy)}</p><div class="landing-feature-grid">${features}</div></section>` +
+    `<section style="margin-top:16px">${walrusProof(locale)}</section>` +
+    `<footer>${esc(t.footer)}</footer>`;
+  return page(locale, "landing", "WC Radar · World Cup Market Intelligence", body, model, 120, "/");
+}
+
 export function boardPage(locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
+  const resultLookup = createResultLookup();
   const t = COPY[locale];
   const rows = model.matches.map((m) => m.row);
   const highLiquidity = model.opportunities.filter((o) => o.liquidity !== null).sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0)).slice(0, 6);
@@ -1427,7 +1660,7 @@ export function boardPage(locale: Locale = "zh"): string {
   const alerts = countAlerts24h();
   const body =
     bettingPlanPanel(locale, model) +
-    `<section class="priority-grid"><div class="panel"><div class="panel-head"><h2>${locale === "zh" ? "近期重点比赛" : "Priority Matches"}</h2><div class="mini">${alerts ? `<a class="chip stale" href="#alerts">Alerts <b>${alerts}</b></a>` : ""}<span class="chip">Sampled PM <b>${model.metrics.sampledMarkets}</b></span><span class="chip">${esc(t.metrics.opportunities)} <b>${model.metrics.aiOpportunityCount}</b></span></div></div>${priorityMatches(locale, model.matches)}</div>${briefPanel(locale, model, rows)}</section>` +
+    `<section class="priority-grid"><div class="panel"><div class="panel-head"><h2>${locale === "zh" ? "近期重点比赛" : "Priority Matches"}</h2><div class="mini">${alerts ? `<a class="chip stale" href="#alerts">Alerts <b>${alerts}</b></a>` : ""}<span class="chip">Sampled PM <b>${model.metrics.sampledMarkets}</b></span><span class="chip">${esc(t.metrics.opportunities)} <b>${model.metrics.aiOpportunityCount}</b></span></div></div>${priorityMatches(locale, model.matches, resultLookup)}</div>${briefPanel(locale, model, rows)}</section>` +
     metricStrip(locale, model) +
     `<div class="bento">` +
     edgePanels(locale, rows) +
@@ -1442,7 +1675,29 @@ export function boardPage(locale: Locale = "zh"): string {
     healthPanel(locale) +
     `<section class="span12">${walrusProof(locale)}</section>` +
     `</div><footer>${esc(t.footer)}</footer>`;
-  return page(locale, "home", t.heroTitle, body, model);
+  return page(locale, "home", t.heroTitle, body, model, 60, "/radar");
+}
+
+export function alertsPage(locale: Locale = "zh"): string {
+  const model = getMarketRadar(70);
+  const recent = listRecentAlerts(50);
+  const pushed = SERVERCHAN_KEY ? (locale === "zh" ? "已配置" : "on") : (locale === "zh" ? "未配置" : "off");
+  const items = recent.length
+    ? recent.map((alert) => alertLine(locale, alert)).join("")
+    : `<p class="dim">${locale === "zh" ? "还没有记录到价格提醒。" : "No price alerts have been logged yet."}</p>`;
+  const body =
+    `<section class="panel" style="margin-top:16px">` +
+    `<div class="hero-title">${locale === "zh" ? "价格提醒" : "Price Alerts"}</div>` +
+    `<p class="hero-sub">${locale === "zh" ? "集中查看盘口突变、体彩价差和健康检查告警。这里展示的是本地 alert_log 记录；推送是否发送取决于 Server 酱配置和每日上限。" : "A focused view of line moves, Sporttery edges, and health alerts from the local alert_log. Push delivery depends on ServerChan configuration and the daily cap."}</p>` +
+    `<div class="metric-strip">` +
+    `<div class="metric-card"><div class="label">${locale === "zh" ? "24 小时" : "24h"}</div><div class="value">${countAlerts24h()}</div><div class="hint">${locale === "zh" ? "最近告警数" : "Recent alerts"}</div></div>` +
+    `<div class="metric-card"><div class="label">ServerChan</div><div class="value">${esc(pushed)}</div><div class="hint">${locale === "zh" ? "未配置时只落库不推送" : "Logs only when off"}</div></div>` +
+    `<div class="metric-card"><div class="label">${locale === "zh" ? "每日上限" : "Daily cap"}</div><div class="value">${ALERT_MAX_PER_DAY}</div><div class="hint">${locale === "zh" ? "防止免费额度爆掉" : "Protects free quota"}</div></div>` +
+    `<div class="metric-card"><div class="label">${locale === "zh" ? "页面入口" : "Radar anchor"}</div><div class="value">${recent.length}</div><div class="hint"><a href="${href("/radar", locale)}#alerts">${locale === "zh" ? "回到雷达面板" : "Back to radar panel"}</a></div></div>` +
+    `</div></section>` +
+    `<section class="panel" style="margin-top:14px"><div class="panel-head"><h2>${locale === "zh" ? "最近 50 条" : "Latest 50"}</h2><a href="${href("/radar", locale)}#alerts">${locale === "zh" ? "雷达页片段" : "Radar section"}</a></div>${items}</section>` +
+    `<footer>${esc(COPY[locale].footer)}</footer>`;
+  return page(locale, "alerts", `${locale === "zh" ? "价格提醒" : "Price Alerts"} · WC Radar`, body, model, 60, "/alerts");
 }
 
 export function readWalrusManifest(): Record<string, unknown> | null {
@@ -1465,14 +1720,9 @@ function readWalrusJson(relativePath: string): Record<string, unknown> | null {
   }
 }
 
-function walrusBlobHref(blobId: string): string | null {
-  const base = WALRUS_AGGREGATOR_URL.trim().replace(/\/+$/, "");
-  return base ? `${base}/v1/blobs/${encodeURIComponent(blobId)}` : null;
-}
-
 function walrusManifestHref(): string | null {
   const blob = getMeta("walrus_latest_manifest_blob_id");
-  return blob ? walrusBlobHref(blob) : null;
+  return walrusBlobJsonUrl(blob);
 }
 
 function decodePath(raw: string): string {
@@ -1490,13 +1740,14 @@ function walrusArtifactsTable(locale: Locale, manifest: Record<string, unknown> 
     .map((artifact) => {
       const walrus = artifact.walrus && typeof artifact.walrus === "object" ? (artifact.walrus as Record<string, unknown>) : {};
       const blob = typeof walrus.blob_id === "string" ? walrus.blob_id : "";
-      const hrefBlob = blob ? walrusBlobHref(blob) : null;
+      const hrefBlob = walrusBlobJsonUrl(blob);
+      const hrefExplorer = walrusExplorerUrl(blob, String(manifest?.walrus_network ?? manifest?.network ?? getMeta("walrus_latest_network") ?? "testnet"));
       return (
         `<tr><td>${esc(decodePath(String(artifact.relativePath ?? artifact.name ?? "-")))}</td>` +
         `<td class="num">${money(Number(artifact.bytes ?? 0), 0)}</td>` +
         `<td class="mono">${esc(String(artifact.sha256 ?? "-")).slice(0, 18)}</td>` +
         `<td class="mono">${hrefBlob ? `<a href="${esc(hrefBlob)}">${esc(blob.slice(0, 18))}</a>` : esc(blob ? blob.slice(0, 18) : "-")}</td>` +
-        `<td>${hrefBlob ? `<a class="btn" href="${esc(hrefBlob)}">${locale === "zh" ? "打开数据" : "Open data"}</a>` : `<span class="dim">${locale === "zh" ? "未发布" : "Not published"}</span>`}</td></tr>`
+        `<td><div class="mini">${hrefBlob ? `<a class="btn" href="${esc(hrefBlob)}">${locale === "zh" ? "打开 JSON" : "Open JSON"}</a>` : ""}${hrefExplorer ? `<a class="btn" href="${esc(hrefExplorer)}">${locale === "zh" ? "Walrus 浏览器" : "Walruscan"}</a>` : ""}${!hrefBlob && !hrefExplorer ? `<span class="dim">${locale === "zh" ? "未发布" : "Not published"}</span>` : ""}</div></td></tr>`
       );
     })
     .join("");
@@ -1536,7 +1787,8 @@ function walrusDataPreview(locale: Locale): string {
     );
   }).join("");
 
-  const latestAnalysis = ai?.latest_analysis && typeof ai.latest_analysis === "object" ? (ai.latest_analysis as Record<string, unknown>) : null;
+  const localizedAnalysis = locale === "zh" ? (ai?.latest_analysis_zh ?? ai?.latest_analysis) : (ai?.latest_analysis_en ?? ai?.latest_analysis);
+  const latestAnalysis = localizedAnalysis && typeof localizedAnalysis === "object" ? (localizedAnalysis as Record<string, unknown>) : null;
   const verdict = latestAnalysis?.verdict && typeof latestAnalysis.verdict === "object" ? (latestAnalysis.verdict as BoardBettingVerdict) : null;
   const digest = verdict
     ? latestBettingSummary(locale, verdict)
@@ -1547,6 +1799,76 @@ function walrusDataPreview(locale: Locale): string {
     `<div class="section-head"><h2>${locale === "zh" ? "Top 机会数据" : "Top opportunity data"}</h2></div>` +
     (opportunityRows ? `<table class="compact-table"><tr><th>Match</th><th>Outcome</th><th>Platform</th><th class="num">Score</th><th>Risk</th></tr>${opportunityRows}</table>` : `<p class="dim">${locale === "zh" ? "暂无机会数据。" : "No opportunity data yet."}</p>`) +
     `<div class="section-head"><h2>${locale === "zh" ? "AI 公共摘要" : "Public AI digest"}</h2></div>${digest}`
+  );
+}
+
+function walrusRemotePreview(locale: Locale): string {
+  const manifestBlob = getMeta("walrus_latest_manifest_blob_id");
+  const manifestUrl = walrusBlobJsonUrl(manifestBlob);
+  if (!manifestBlob) {
+    return `<p class="dim">${locale === "zh" ? "还没有已发布的 manifest blob，远程 Walrus 读取预览不可用。" : "No published manifest blob yet, so remote Walrus preview is unavailable."}</p>`;
+  }
+  if (!manifestUrl) {
+    return `<p class="dim">${locale === "zh" ? "已记录 manifest blob，但未配置 WALRUS_AGGREGATOR_URL，无法直接读取远程 JSON。" : "A manifest blob is recorded, but WALRUS_AGGREGATOR_URL is not configured for direct JSON reads."}</p>`;
+  }
+  return (
+    `<div id="walrus-remote-preview"><p class="dim">${locale === "zh" ? "正在从 Walrus aggregator 读取 manifest 与足球数据..." : "Reading manifest and football data from the Walrus aggregator..."}</p></div>` +
+    `<script>
+(function(){
+  var root=document.getElementById("walrus-remote-preview");
+  if(!root) return;
+  var manifestUrl=${JSON.stringify(manifestUrl)};
+  var aggregatorBase=${JSON.stringify(manifestUrl.replace(/\/v1\/blobs\/[^/]+$/, ""))};
+  var lang=${JSON.stringify(locale)};
+  function h(v){ return String(v==null?"":v).replace(/[&<>"]/g,function(c){ if(c==="&") return "&amp;"; if(c==="<") return "&lt;"; if(c===">") return "&gt;"; return "&quot;"; }); }
+  function compactNumber(v){ if(typeof v!=="number" || !Number.isFinite(v)) return "-"; return v.toLocaleString(undefined,{maximumFractionDigits:0}); }
+  function compactMoney(v){ if(typeof v!=="number" || !Number.isFinite(v)) return "-"; if(Math.abs(v)>=1000000) return "$"+(v/1000000).toFixed(1)+"M"; if(Math.abs(v)>=1000) return "$"+(v/1000).toFixed(1)+"K"; return "$"+v.toLocaleString(undefined,{maximumFractionDigits:0}); }
+  function blobUrl(blob){ return aggregatorBase + "/v1/blobs/" + encodeURIComponent(blob); }
+  function artifact(manifest, path){
+    return (manifest.artifacts||[]).find(function(a){ return a && a.relativePath===path && a.walrus && a.walrus.blob_id; });
+  }
+  async function readArtifact(manifest, path){
+    var a=artifact(manifest,path);
+    if(!a) return null;
+    var res=await fetch(blobUrl(a.walrus.blob_id));
+    if(!res.ok) throw new Error(path+" HTTP "+res.status);
+    return await res.json();
+  }
+  function metricsHtml(radar){
+    var m=(radar && radar.metrics) || {};
+    var cards=[
+      [lang==="zh"?"总市场":"Total markets", compactNumber(m.totalMarkets)],
+      ["PM liquidity", compactMoney(m.pmLiquidity)],
+      ["24h volume", compactMoney(m.pmVolume24h)],
+      [lang==="zh"?"AI 机会":"AI opportunities", compactNumber(m.aiOpportunityCount)],
+      ["Sampled", compactNumber(m.sampledMarkets)]
+    ];
+    return "<div class='proof-grid'>"+cards.map(function(x){ return "<div><span>"+h(x[0])+"</span><b>"+h(x[1])+"</b></div>"; }).join("")+"</div>";
+  }
+  function oppHtml(data){
+    var rows=(data && data.opportunities) || [];
+    var top=rows.slice(0,6).map(function(row){
+      var match=row.match || ((row.home_team||"-")+" vs "+(row.away_team||"-"));
+      var score=typeof row.opportunity_score==="number" ? Math.round(row.opportunity_score) : "-";
+      return "<tr><td>"+h(match)+"</td><td>"+h(row.outcome||"-")+"</td><td>"+h(row.platform||"-")+"</td><td class='num'>"+h(score)+"</td><td>"+h(row.risk_level||"-")+"</td></tr>";
+    }).join("");
+    if(!top) return "<p class='dim'>"+(lang==="zh"?"Walrus 远程数据里暂无机会数据。":"No opportunity data in the remote Walrus feed.")+"</p>";
+    return "<table class='compact-table'><tr><th>Match</th><th>Outcome</th><th>Platform</th><th class='num'>Score</th><th>Risk</th></tr>"+top+"</table>";
+  }
+  (async function(){
+    try{
+      var manifestRes=await fetch(manifestUrl);
+      if(!manifestRes.ok) throw new Error("manifest HTTP "+manifestRes.status);
+      var manifest=await manifestRes.json();
+      var radar=await readArtifact(manifest,"radar-latest.json");
+      var opportunities=await readArtifact(manifest,"opportunities-latest.json");
+      root.innerHTML="<div class='muted-line'>"+h(lang==="zh"?"来源: Walrus remote blobs":"Source: Walrus remote blobs")+" · "+h(manifest.generated_at||"")+"</div>"+metricsHtml(radar)+"<div class='section-head'><h2>"+h(lang==="zh"?"Walrus 足球机会":"Walrus Football Opportunities")+"</h2><span class='badge low'>Walrus-sourced</span></div>"+oppHtml(opportunities||radar);
+    }catch(e){
+      root.innerHTML="<p class='dim'>"+h((lang==="zh"?"Walrus 远程读取失败: ":"Remote Walrus read failed: ")+(e && e.message ? e.message : String(e)))+"</p>";
+    }
+  })();
+})();
+</script>`
   );
 }
 
@@ -1566,14 +1888,16 @@ export function walrusPage(locale: Locale = "zh"): string {
   const manifest = readWalrusManifest();
   const generated = typeof manifest?.generated_at === "string" ? manifest.generated_at : getMeta("walrus_latest_published_at");
   const manifestHref = walrusManifestHref();
-  const latest = latestBoardVerdict();
+  const manifestExplorerHref = walrusExplorerUrl(getMeta("walrus_latest_manifest_blob_id"), getMeta("walrus_latest_network") ?? "testnet");
+  const latest = latestBoardVerdict(locale, null);
   const body =
     `<section class="panel" style="margin-top:16px"><div class="hero-title">Walrus Data</div><p class="hero-sub">${locale === "zh" ? "公开、可验证的市场快照。这里展示 latest manifest、artifact、blob、AI 公共摘要和发布日志；用户本金、下注金额、API key 不会进入 Walrus。" : "Public verifiable market snapshots. This page shows the latest manifest, artifacts, blobs, public AI summary, and publish logs; user bankroll, stake amounts, and API keys are not exported."}</p></section>` +
     `<section style="margin-top:14px">${walrusProof(locale)}</section>` +
     `<div class="bento" style="margin-top:14px">` +
-    `<section class="span8 panel"><div class="panel-head"><h2>Manifest</h2><div class="mini"><span class="badge info">${esc(String(manifest?.schema_version ?? getMeta("walrus_latest_schema_version") ?? "-"))}</span>${manifestHref ? `<a class="btn" href="${esc(manifestHref)}">${locale === "zh" ? "打开 manifest JSON" : "Open manifest JSON"}</a>` : ""}<a class="btn" href="/api/walrus">${locale === "zh" ? "打开 /api/walrus" : "Open /api/walrus"}</a></div></div><div class="proof-grid"><div><span>${locale === "zh" ? "生成时间" : "Generated"}</span><b>${generated ? esc(fullTime(locale, new Date(generated))) : "-"}</b></div><div><span>Network</span><b>${esc(String(manifest?.network ?? getMeta("walrus_latest_network") ?? "testnet"))}</b></div><div><span>Artifacts</span><b>${Array.isArray(manifest?.artifacts) ? manifest.artifacts.length : getMeta("walrus_latest_artifact_count") ?? "-"}</b></div></div><div style="margin-top:12px">${walrusArtifactsTable(locale, manifest)}</div></section>` +
+    `<section class="span8 panel"><div class="panel-head"><h2>Manifest</h2><div class="mini"><span class="badge info">${esc(String(manifest?.schema_version ?? getMeta("walrus_latest_schema_version") ?? "-"))}</span>${manifestHref ? `<a class="btn" href="${esc(manifestHref)}">${locale === "zh" ? "打开 manifest JSON" : "Open manifest JSON"}</a>` : ""}${manifestExplorerHref ? `<a class="btn" href="${esc(manifestExplorerHref)}">${locale === "zh" ? "Walrus 浏览器" : "Walruscan"}</a>` : ""}<a class="btn" href="/api/walrus">${locale === "zh" ? "打开 /api/walrus" : "Open /api/walrus"}</a></div></div><div class="proof-grid"><div><span>${locale === "zh" ? "生成时间" : "Generated"}</span><b>${generated ? esc(fullTime(locale, new Date(generated))) : "-"}</b></div><div><span>Network</span><b>${esc(String(manifest?.network ?? getMeta("walrus_latest_network") ?? "testnet"))}</b></div><div><span>Artifacts</span><b>${Array.isArray(manifest?.artifacts) ? manifest.artifacts.length : getMeta("walrus_latest_artifact_count") ?? "-"}</b></div></div><div style="margin-top:12px">${walrusArtifactsTable(locale, manifest)}</div></section>` +
     `<section class="span4 panel"><div class="panel-head"><h2>${locale === "zh" ? "公共 AI 摘要" : "Public AI Digest"}</h2></div>${latest?.verdict ? latestBettingSummary(locale, latest.verdict) : `<p class="dim">${locale === "zh" ? "还没有公开 AI 摘要。" : "No public AI digest yet."}</p>`}</section>` +
     `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "数据预览" : "Data Preview"}</h2><span class="badge info">${locale === "zh" ? "本地 JSON" : "Local JSON"}</span></div>${walrusDataPreview(locale)}</section>` +
+    `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "Walrus 远程读取" : "Walrus Remote Read"}</h2><span class="badge low">Walrus-sourced</span></div>${walrusRemotePreview(locale)}</section>` +
     `<section class="span12 panel"><div class="panel-head"><h2>${locale === "zh" ? "发布日志" : "Publish Log"}</h2></div>${walrusLogPanel(locale)}</section>` +
     `</div><footer>${esc(COPY[locale].footer)}</footer>`;
   return page(locale, "walrus", "Walrus Data · WC Radar", body, model, 120, "/walrus");
@@ -1901,14 +2225,14 @@ function reviewSourceTable(locale: Locale, row: CurrentOddsRow): string {
   const coreEntries = core.filter((s) => row.sourceOdds[s]).map((s) => [s, row.sourceOdds[s]] as [string, ThreeWay]);
   const restEntries = Object.entries(row.sourceOdds).filter(([s]) => !core.includes(s));
   const diffCell = (label: Label, probs: ThreeWay): string => {
-    if (!row.bookAvg) return `<td class="num">${pct(probs[label])}</td>`;
+    if (!row.bookAvg) return probabilityCell(probs, label, pct(probs[label]));
     const diff = (probs[label] - row.bookAvg[label]) * 100;
     const cls = diff >= 2 ? "neg" : diff <= -2 ? "pos" : "dim";
-    return `<td class="num">${pct(probs[label])} <span class="${cls}" style="font-size:11px">${signedPp(diff)}</span></td>`;
+    return probabilityCell(probs, label, `${pct(probs[label])} <span class="${cls}" style="font-size:11px">${signedPp(diff)}</span>`);
   };
   const head = `<tr><th>${locale === "zh" ? "平台" : "Platform"}</th>${LABELS.map((label) => `<th class="num">${esc(outcomeName(locale, row, label))}</th>`).join("")}</tr>`;
   const avgRow = row.bookAvg
-    ? `<tr style="font-weight:650"><td>${locale === "zh" ? "书商中位" : "Book median"} (${row.books})</td>${LABELS.map((label) => `<td class="num">${pct(row.bookAvg![label])}</td>`).join("")}</tr>`
+    ? `<tr style="font-weight:650"><td>${locale === "zh" ? "书商中位" : "Book median"} (${row.books})</td>${LABELS.map((label) => probabilityCell(row.bookAvg!, label, pct(row.bookAvg![label]))).join("")}</tr>`
     : "";
   const tr = ([source, probs]: [string, ThreeWay]): string => `<tr><td>${esc(source)}</td>${LABELS.map((label) => diffCell(label, probs)).join("")}</tr>`;
   const coreTable = `<table>${head}${avgRow}${coreEntries.map(tr).join("")}</table>`;
@@ -1954,18 +2278,15 @@ function reviewControls(locale: Locale, count: number): string {
   );
 }
 
-function reviewCard(locale: Locale, m: ReviewMatch): string {
+function reviewCard(locale: Locale, m: ReviewMatch, open = false): string {
   const row = m.row;
   const bundle = m.bundle;
   const markers = reviewGoalMarkers(locale, row, bundle);
   const title = matchNameFromRow(locale, row);
   const platforms = [...new Set(m.sources.map((s) => (sourcePriority(s) < 9 ? s : "book")))].join(" ");
-  const score =
-    bundle.result && bundle.result.homeScore !== null && bundle.result.awayScore !== null
-      ? `${bundle.result.homeScore}-${bundle.result.awayScore}`
-      : locale === "zh"
-        ? "比分待补"
-        : "No score";
+  const pendingScore =
+    `<div class="rv-card-score pending"><b>${locale === "zh" ? "比分待补" : "No score"}</b><small>${locale === "zh" ? "等待赛果采集" : "waiting for result"}</small></div>`;
+  const resultScore = scoreBadge(locale, row, bundle, "review") || pendingScore;
   const topTime = m.topJumps[0] ? fullTime(locale, new Date(m.topJumps[0].ts)) : "—";
   const prederr = m.predictionErrorPp;
   const h3 = (label: string): string => `<h3 class="rv-h3">${esc(label)}</h3>`;
@@ -1978,14 +2299,32 @@ function reviewCard(locale: Locale, m: ReviewMatch): string {
     `<div>${reviewTimeline(locale, row, bundle)}</div>` +
     `<div>${h3(locale === "zh" ? "多源概率" : "Multi-source probabilities")}${reviewSourceTable(locale, row)}</div>`;
   return (
-    `<details class="review-card" data-search="${esc((row.homeTeam + " " + row.awayTeam + " " + title).toLowerCase())}" data-platforms="${esc(platforms)}" data-quality="${m.quality}" data-turn="${m.maxTurnPp.toFixed(2)}" data-kickoff="${Date.parse(row.kickoffUtc) || 0}" data-completeness="${m.completeness}" data-prederr="${prederr === null ? -1 : prederr.toFixed(2)}" data-divergence="${reviewDivergencePp(row).toFixed(2)}">` +
+    `<details class="review-card"${open ? " open" : ""} data-search="${esc((row.homeTeam + " " + row.awayTeam + " " + title).toLowerCase())}" data-platforms="${esc(platforms)}" data-quality="${m.quality}" data-turn="${m.maxTurnPp.toFixed(2)}" data-kickoff="${Date.parse(row.kickoffUtc) || 0}" data-completeness="${m.completeness}" data-prederr="${prederr === null ? -1 : prederr.toFixed(2)}" data-divergence="${reviewDivergencePp(row).toFixed(2)}">` +
     `<summary>` +
-    `<div class="rv-card-top"><span class="rv-title">${esc(title)}</span><span class="badge ${reviewQualityClass(m.quality)}">${esc(reviewQualityLabel(locale, m.quality))}</span><span class="rv-card-score">${esc(score)}</span></div>` +
+    `<div class="rv-card-top"><span class="rv-title">${esc(title)}</span><span class="badge ${reviewQualityClass(m.quality)}">${esc(reviewQualityLabel(locale, m.quality))}</span>${resultScore}</div>` +
     `<div class="rv-card-metrics"><span>${locale === "zh" ? "最大转折" : "Max turn"} <b>${m.maxTurnPp.toFixed(1)}pp</b>${m.keyPlatform ? ` · ${esc(m.keyPlatform)}` : ""}</span><span>${locale === "zh" ? "转折时间" : "Turn time"} <b>${esc(topTime)}</b></span>${prederr !== null ? `<span>${locale === "zh" ? "赛前低估" : "Pre-match miss"} <b>${prederr.toFixed(0)}pp</b></span>` : ""}<span>${locale === "zh" ? "完整度" : "Completeness"} <b>${m.completeness}</b></span></div>` +
     `<div class="rv-card-summary-line">${esc(reviewKeyTurn(locale, row, m.history, bundle))}</div>` +
     `</summary>` +
     `<div class="review-detail">${detail}</div>` +
     `</details>`
+  );
+}
+
+function reviewMetrics(locale: Locale, matches: ReviewMatch[]): string {
+  const scored = matches.filter((m) => m.bundle.result && m.bundle.result.homeScore !== null && m.bundle.result.awayScore !== null).length;
+  const withEvents = matches.filter((m) => m.bundle.events.length > 0).length;
+  const oddsOnly = matches.filter((m) => m.quality === "odds_only" || m.quality === "no_goal_events").length;
+  const maxTurn = matches.reduce((mx, m) => Math.max(mx, m.maxTurnPp), 0);
+  const card = (label: string, value: string, hint: string): string =>
+    `<div class="metric-card"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="hint">${esc(hint)}</div></div>`;
+  return (
+    `<div class="metric-strip" style="margin-top:12px">` +
+    card(locale === "zh" ? "复盘场次" : "Reviews", String(matches.length), locale === "zh" ? "已结束且可回放" : "completed matches") +
+    card(locale === "zh" ? "已匹配比分" : "Scores", String(scored), locale === "zh" ? "来自赛果源" : "from result sources") +
+    card(locale === "zh" ? "事件时间轴" : "Event timelines", String(withEvents), locale === "zh" ? "需 API-Football" : "requires API-Football") +
+    card(locale === "zh" ? "仅赔率/比分" : "Odds/score only", String(oddsOnly), locale === "zh" ? "无进球事件" : "no goal events") +
+    card(locale === "zh" ? "最大转折" : "Biggest turn", `${maxTurn.toFixed(1)}pp`, locale === "zh" ? "已排序可筛选" : "sortable below") +
+    `</div>`
   );
 }
 
@@ -2056,6 +2395,26 @@ function reviewFilterSortScript(): string {
 </script>`;
 }
 
+function reviewSourceStatus(locale: Locale): string {
+  const ago = (ts: string | null): string => {
+    if (!ts) return locale === "zh" ? "从未" : "never";
+    const age = Date.now() - Date.parse(ts);
+    return fmtAge(Number.isFinite(age) ? age : null);
+  };
+  const statusChip = (label: string, source: ResultSourceStatus, cls = ""): string => {
+    const matched = locale === "zh" ? `匹配 ${source.matchedRows}/${source.rows}` : `matched ${source.matchedRows}/${source.rows}`;
+    const suffix = source.configured ? matched : (locale === "zh" ? "未配置" : "off");
+    return `<span class="chip ${cls}">${esc(label)} <b>${esc(ago(source.lastCall))}</b><span>${esc(suffix)}</span></span>`;
+  };
+  const sources = getResultSourceStatuses();
+  const chips = [
+    statusChip("API-Football", sources.apiFootball, sources.apiFootball.configured ? "ok" : "warn"),
+    statusChip("Sporttery scores", sources.sportteryResults),
+    statusChip("Odds scores", sources.oddsApiScores, sources.oddsApiScores.configured ? "" : "warn"),
+  ].join("");
+  return `<div class="mini" style="margin-top:10px">${chips}</div>`;
+}
+
 export function reviewPage(locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
   const matches = getReviewBoard(24);
@@ -2064,12 +2423,12 @@ export function reviewPage(locale: Locale = "zh"): string {
       ? "已启用赛果事件源；匹配到的比赛会显示比分、进球时间轴，并把进球标到赔率走势图上。"
       : "Result/event source is enabled; matched games show score, goal timeline, and goal markers on charts."
     : locale === "zh"
-      ? "未配置 API_FOOTBALL_KEY 时，这里会清楚降级为赔率复盘；若 The Odds API scores 可用，则只补比分、不显示进球事件。"
-      : "Without API_FOOTBALL_KEY this clearly degrades to odds review. The Odds API scores fallback can add score only, not events.";
+      ? "未配置 API_FOOTBALL_KEY 时，会先尝试体彩公开赛果补比分，再用 The Odds API scores 兜底；这些来源只补比分、不显示进球事件。"
+      : "Without API_FOOTBALL_KEY this tries Sporttery public scores first, then The Odds API scores; these score-only sources do not provide goal events.";
   const body =
-    `<section class="panel" style="margin-top:16px"><div class="hero-title">${locale === "zh" ? "赛后复盘" : "Post-match Review"}</div><p class="hero-sub">${locale === "zh" ? "默认只看复盘列表;点开任意一场展开三段式解读、关键转折、平台反应速度与多源概率。窗口为开赛前 24h 到开赛后 2.5h。" : "A review list by default; expand any match for the three-part read, key turns, platform reaction speed, and multi-source probabilities. Window is 24h before to 2.5h after kickoff."}</p><div class="muted-line">${esc(resultNote)}</div></section>` +
+    `<section class="panel" style="margin-top:16px"><div class="hero-title">${locale === "zh" ? "赛后复盘" : "Post-match Review"}</div><p class="hero-sub">${locale === "zh" ? "已完赛比赛会直接显示比分;第一场默认展开。继续点开任意一场可看三段式解读、关键转折、平台反应速度与多源概率。窗口为开赛前 24h 到开赛后 2.5h。" : "Completed matches show scorelines directly; the first review is expanded by default. Open any match for the three-part read, key turns, platform reaction speed, and multi-source probabilities. Window is 24h before to 2.5h after kickoff."}</p><div class="muted-line">${esc(resultNote)}</div>${reviewSourceStatus(locale)}${reviewMetrics(locale, matches)}</section>` +
     reviewControls(locale, matches.length) +
-    `<section id="review-list" style="margin-top:14px;display:grid;gap:12px">${matches.length ? matches.map((m) => reviewCard(locale, m)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "还没有可复盘的已结束比赛。" : "No completed matches to review yet."}</p></div>`}</section>` +
+    `<section id="review-list" style="margin-top:14px;display:grid;gap:12px">${matches.length ? matches.map((m, index) => reviewCard(locale, m, index === 0)).join("") : `<div class="panel"><p class="dim">${locale === "zh" ? "还没有可复盘的已结束比赛。" : "No completed matches to review yet."}</p></div>`}</section>` +
     reviewFilterSortScript() +
     `<footer>${esc(COPY[locale].footer)}</footer>`;
   return page(locale, "review", `${locale === "zh" ? "赛后复盘" : "Post-match Review"} · WC Radar`, body, model, 300, "/review");
@@ -2156,6 +2515,20 @@ function aiAnalysisPanel(locale: Locale, fixtureKey: string, row: CurrentOddsRow
   const latest = history[0];
   const rest = history.slice(1);
   const promptOpen = keyReady || locale === "en" ? "" : " open";
+  const systemPromptHtml =
+    locale === "en"
+      ? `<textarea id="ai-system" class="prompt-box" data-prompt-b64="${Buffer.from(systemPrompt, "utf8").toString("base64")}" readonly>Chinese system template is hidden in English UI. Switch to Chinese to edit it, or copy the full prompt.</textarea>`
+      : `<textarea id="ai-system" class="prompt-box">${esc(systemPrompt)}</textarea>`;
+  const contextPromptHtml =
+    context && locale === "en"
+      ? `<pre id="ai-context" class="prompt-box" data-prompt-b64="${Buffer.from(context.prompt, "utf8").toString("base64")}">Chinese data context is hidden in English UI. Use Copy prompt to export the full analysis input.</pre>`
+      : context
+        ? `<pre id="ai-context" class="prompt-box">${esc(context.prompt)}</pre>`
+        : "";
+  const promptActions =
+    locale === "en"
+      ? `<div class="mini" style="margin:8px 0 12px"><button type="button" class="btn" onclick="aiCopyPrompt()">Copy full prompt</button><span id="ai-tpl-status" class="dim"></span></div>`
+      : `<div class="mini" style="margin:8px 0 12px"><button type="button" class="btn" onclick="aiSaveTemplate()">保存模板</button><button type="button" class="btn" onclick="aiResetTemplate()">恢复默认</button><button type="button" class="btn" onclick="aiCopyPrompt()">复制完整 prompt</button><span id="ai-tpl-status" class="dim"></span></div>`;
   const contextSummary = matchIntel
     ? explainMarket(locale, matchIntel.aiExplanation)
     : locale === "zh"
@@ -2163,9 +2536,9 @@ function aiAnalysisPanel(locale: Locale, fixtureKey: string, row: CurrentOddsRow
       : "Market metrics will deepen the context after collection.";
   const promptBlock = context
     ? `<details${promptOpen}><summary>${locale === "zh" ? "查看/编辑 prompt（系统模板 + 数据上下文）" : "View/edit prompt"}</summary><div class="panel" style="margin-top:8px">` +
-      `<div class="opp-title">${locale === "zh" ? "系统模板" : "System template"}</div><textarea id="ai-system" class="prompt-box">${esc(systemPrompt)}</textarea>` +
-      `<div class="mini" style="margin:8px 0 12px"><button type="button" class="btn" onclick="aiSaveTemplate()">${locale === "zh" ? "保存模板" : "Save"}</button><button type="button" class="btn" onclick="aiResetTemplate()">${locale === "zh" ? "恢复默认" : "Reset"}</button><button type="button" class="btn" onclick="aiCopyPrompt()">${locale === "zh" ? "复制完整 prompt" : "Copy prompt"}</button><span id="ai-tpl-status" class="dim"></span></div>` +
-      `<div class="opp-title">${locale === "zh" ? "数据上下文" : "Data context"}</div><pre id="ai-context" class="prompt-box">${esc(context.prompt)}</pre>` +
+      `<div class="opp-title">${locale === "zh" ? "系统模板" : "System template"}</div>${systemPromptHtml}` +
+      promptActions +
+      `<div class="opp-title">${locale === "zh" ? "数据上下文" : "Data context"}</div>${contextPromptHtml}` +
       `</div></details>`
     : `<p class="dim">${locale === "zh" ? "无法组装 AI 上下文。" : "Could not build AI context."}</p>`;
   const action = context
@@ -2175,7 +2548,7 @@ function aiAnalysisPanel(locale: Locale, fixtureKey: string, row: CurrentOddsRow
     : "";
   const latestHtml = latest
     ? analysisCard(locale, row, latest, true)
-    : `<div class="panel analysis-card"><div class="panel-head"><h2>${esc(COPY[locale].sections.matchSummary)}</h2><span class="badge mute">${locale === "zh" ? "未生成" : "Not generated"}</span></div><p class="hero-sub">${esc(contextSummary)}</p><div class="mini"><span>${esc(COPY[locale].labels.noFabrication)}</span>${row.bookAvg ? `<span>${esc(COPY[locale].labels.marketConsensus)} ${formatThreeWayShort(row.bookAvg)}</span>` : ""}</div></div>`;
+    : `<div class="panel analysis-card"><div class="panel-head"><h2>${esc(COPY[locale].sections.matchSummary)}</h2><span class="badge mute">${locale === "zh" ? "未生成" : "Not generated"}</span></div><p class="hero-sub">${esc(contextSummary)}</p><div class="mini"><span>${esc(COPY[locale].labels.noFabrication)}</span>${row.bookAvg ? `<span>${esc(COPY[locale].labels.marketConsensus)} ${compactProbability(locale, row, row.bookAvg)}</span>` : ""}</div></div>`;
   const historyHtml = rest.length
     ? `<details class="details-panel"><summary>${locale === "zh" ? `历史分析 ${rest.length} 条` : `${rest.length} prior analyses`}</summary>${rest.map((analysis) => analysisCard(locale, row, analysis)).join("")}</details>`
     : "";
@@ -2209,8 +2582,15 @@ async function aiResetTemplate(){
   var res=await fetch("/api/template",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({reset:true})});
   if(res.ok){ var data=await res.json(); document.getElementById("ai-system").value=data.template; if(status) status.textContent=${JSON.stringify(locale === "zh" ? "已恢复默认" : "Reset")}; }
 }
+function aiDecodePrompt(el){
+  var b64=el && el.getAttribute ? el.getAttribute("data-prompt-b64") : "";
+  if(!b64) return el ? (el.value || el.textContent || "") : "";
+  var bin=atob(b64), bytes=new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
 async function aiCopyPrompt(){
-  var full=document.getElementById("ai-system").value + "\\n\\n---\\n\\n" + document.getElementById("ai-context").textContent;
+  var full=aiDecodePrompt(document.getElementById("ai-system")) + "\\n\\n---\\n\\n" + aiDecodePrompt(document.getElementById("ai-context"));
   await navigator.clipboard.writeText(full);
   var status=document.getElementById("ai-tpl-status"); if(status) status.textContent=${JSON.stringify(locale === "zh" ? "已复制" : "Copied")};
 }
@@ -2222,26 +2602,28 @@ export function matchPage(fixtureKey: string, locale: Locale = "zh"): string {
   const model = getMarketRadar(70);
   const t = COPY[locale];
   const matchIntel = model.matches.find((m) => m.row.fixtureKey === fixtureKey) ?? getMatchIntelligence(fixtureKey);
-  const row = matchIntel?.row ?? getCurrentOdds(70).find((r) => r.fixtureKey === fixtureKey);
+  const row = matchIntel?.row ?? getCurrentOdds(70).find((r) => r.fixtureKey === fixtureKey) ?? getCompletedOdds(100).find((r) => r.fixtureKey === fixtureKey);
   if (!row) return page(locale, "match", "Match not found", `<section class="panel" style="margin-top:16px"><p class="dim">${esc(t.empty.matchNotFound)}</p></section>`, model);
 
   const kickoff = new Date(row.kickoffUtc);
   const hhad = getSportteryHhad(fixtureKey);
+  const resultBundle = getMatchEventBundle(row.fixtureKey);
+  const center = heroScore(locale, row, resultBundle) || `<div class="countdown"><span class="dim">${esc(t.labels.countdown)}</span><strong>${esc(countdown(locale, row))}</strong>${row.live ? `<span class="live">${esc(t.labels.live)}</span>` : ""}</div>`;
 
   const related =
     `<div class="bento">` +
     `<section class="span8 panel"><div class="panel-head"><h2>${esc(marketTypeLabel(locale, "match_winner"))}</h2></div>${matchIntel ? marketMetricsTable(locale, matchIntel) : `<p class="dim">${esc(t.empty.liquidity)}</p>`}</section>` +
-    `<section class="span4 panel"><div class="panel-head"><h2>HHAD</h2></div>${hhad ? `<p>${esc(hhadLineDesc(locale, hhad.goalLine, row.homeTeam))}</p><div class="mini">${LABELS.map((label) => `<span>${esc(outcomeLabel(locale, label))} <b class="mono">${hhad.sp[label] !== null ? hhad.sp[label]!.toFixed(2) : "-"}</b></span>`).join("")}</div>${hhad.probs ? `<div class="opp-note">${esc(formatThreeWayShort(hhad.probs))}</div>` : ""}` : `<p class="dim">${esc(t.labels.insufficient)}</p>`}</section>` +
+    `<section class="span4 panel"><div class="panel-head"><h2>HHAD</h2></div>${hhad ? `<p>${esc(hhadLineDesc(locale, hhad.goalLine, row.homeTeam))}</p><div class="mini">${LABELS.map((label) => `<span>${esc(outcomeLabel(locale, label))} <b class="mono">${hhad.sp[label] !== null ? hhad.sp[label]!.toFixed(2) : "-"}</b></span>`).join("")}</div>${hhad.probs ? `<div class="opp-note">${compactProbability(locale, row, hhad.probs)}</div>` : ""}` : `<p class="dim">${esc(t.labels.insufficient)}</p>`}</section>` +
     `</div>`;
 
   const body =
     `<section style="margin-top:16px">` +
-    `<div class="match-hero">${teamBadge(locale, row.homeTeam, "home")}<div class="countdown"><span class="dim">${esc(t.labels.countdown)}</span><strong>${esc(countdown(locale, row))}</strong>${row.live ? `<span class="live">${esc(t.labels.live)}</span>` : ""}</div>${teamBadge(locale, row.awayTeam, "away")}</div>` +
+    `<div class="match-hero">${teamBadge(locale, row.homeTeam, "home")}${center}${teamBadge(locale, row.awayTeam, "away")}</div>` +
     `<div class="meta-grid"><div><span>${esc(t.labels.stage)}</span><b>${esc(t.labels.groupStage)}</b></div><div><span>${esc(t.labels.start)}</span><b>${esc(fullTime(locale, kickoff))} CST</b></div><div><span>${esc(t.labels.venue)}</span><b>${esc(t.labels.tbd)}</b></div><div><span>${esc(t.labels.status)}</span><b>${row.live ? esc(t.labels.live) : esc(countdown(locale, row))}</b></div><div><span>${esc(t.labels.fixture)}</span><b class="mono">${esc(row.fixtureKey)}</b></div></div>` +
     `</section>` +
     bettingPlanPanel(locale, model, fixtureKey) +
     `<section class="bento">${aiAnalysisPanel(locale, fixtureKey, row, matchIntel)}<section class="span4 panel"><div class="panel-head"><h2>${esc(t.sections.riskPanel)}</h2></div>${matchIntel ? riskPanel(locale, matchIntel.riskSignals) : `<p class="dim">${esc(t.labels.insufficient)}</p>`}</section></section>` +
-    `<div class="bento">${matchEventsPanel(locale, row)}</div>` +
+    `<div class="bento">${matchEventsPanel(locale, row, resultBundle)}</div>` +
     `<div class="section-head"><h2>${esc(t.sections.sourceOdds)}</h2></div><div class="panel">${sourceTable(locale, row)}</div>` +
     `<div class="bento">${probabilityModelPanel(locale, model, fixtureKey)}</div>` +
     `<div class="section-head"><h2>${esc(t.sections.related)}</h2></div>${related}` +

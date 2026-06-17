@@ -13,7 +13,7 @@ import type { Label } from "../queries/currentOdds.js";
 export type Locale = "zh" | "en";
 
 export function parseLocale(raw: string | null | undefined): Locale {
-  return raw === "en" ? "en" : "zh";
+  return raw === "zh" ? "zh" : "en";
 }
 
 export const LOCALE_NAME: Record<Locale, string> = {
@@ -28,7 +28,7 @@ export const COPY = {
     search: "搜索球队、比赛、市场或平台...",
     opportunities: "市场机会",
     sidebar: {
-      radar: "世界杯雷达",
+      radar: "实时雷达",
       opportunities: "市场机会",
       review: "赛后复盘",
       alerts: "价格提醒",
@@ -40,6 +40,30 @@ export const COPY = {
     aiBrief: "AI 简报",
     signals: "5 条信号",
     heroTitle: "World Cup Market Radar",
+    landing: {
+      eyebrow: "面向 Overflow 评审的世界杯情报层",
+      title: "覆盖 2026 世界杯每场决策的 AI 辅助市场雷达",
+      subtitle:
+        "WC Radar 把赛程、书商赔率、预测市场流动性、体彩价格、盘中变化、赛后证据和 Walrus 快照聚合到一个有纪律的决策面板。",
+      primaryCta: "打开实时雷达",
+      secondaryCta: "查看 Walrus 证明",
+      proofCta: "查看机会榜",
+      reviewCta: "查看赛后复盘",
+      caution: "仅用于研究和模拟。不下注、不托管资金、不承诺收益。",
+      liveTitle: "实时市场面板",
+      liveBody: "对比书商、Polymarket、Kalshi、Pinnacle 与体彩，并显示新鲜度检查和单场赔率历史。",
+      aiTitle: "AI 决策辅助",
+      aiBody: "用临时 API key 生成比赛简报和受资金纪律约束的投注模拟；临时 key 不保存。",
+      walrusTitle: "Walrus 数据层",
+      walrusBody: "发布脱敏聚合快照，包含 manifest hash、artifact 链接和公共 AI 摘要。",
+      reviewTitle: "赛后复盘",
+      reviewBody: "回放开赛前 24 小时到盘中窗口的赔率，并在可用时关联比分和进球事件。",
+      featureTitle: "为世界杯用户设计，不只是采集数据",
+      featureCopy:
+        "面板把可见的世界杯市场数据放进一个工作流，帮助用户识别分歧、避开差价差的方向，并在去外部平台行动前保持风险纪律。",
+      demoTitle: "评审演示路径",
+      demoSteps: ["从首页进入", "打开实时雷达", "检查机会详情", "验证 Walrus artifacts"],
+    },
     metrics: {
       totalMarkets: "总市场",
       volume24h: "24h 成交额",
@@ -146,7 +170,7 @@ export const COPY = {
     search: "Search team, match, market, platform...",
     opportunities: "Market Opportunities",
     sidebar: {
-      radar: "World Cup Radar",
+      radar: "Live Radar",
       opportunities: "Market Opportunities",
       review: "Post-match Review",
       alerts: "Price Alerts",
@@ -158,6 +182,30 @@ export const COPY = {
     aiBrief: "AI Brief",
     signals: "5 signals",
     heroTitle: "World Cup Market Radar",
+    landing: {
+      eyebrow: "Overflow-ready World Cup intelligence",
+      title: "AI-assisted market intelligence for every 2026 World Cup decision",
+      subtitle:
+        "WC Radar aggregates fixtures, bookmaker odds, prediction-market liquidity, Sporttery prices, live movement, post-match evidence, and Walrus snapshots into one disciplined decision board.",
+      primaryCta: "Open live radar",
+      secondaryCta: "View Walrus proof",
+      proofCta: "See opportunities",
+      reviewCta: "Review past matches",
+      caution: "Research and simulation only. It does not place bets, custody funds, or promise profit.",
+      liveTitle: "Live market board",
+      liveBody: "Compare books, Polymarket, Kalshi, Pinnacle, and Sporttery with freshness checks and fixture-level odds history.",
+      aiTitle: "AI decision support",
+      aiBody: "Generate match briefs and bankroll-aware betting simulations using temporary API keys that are never stored.",
+      walrusTitle: "Walrus data layer",
+      walrusBody: "Publish sanitized aggregate snapshots with manifest hashes, artifact links, and public AI digests.",
+      reviewTitle: "Post-match review",
+      reviewBody: "Replay odds from 24h before kickoff through the live window, tied to scorelines and goal events when available.",
+      featureTitle: "Built for World Cup users, not just data collectors",
+      featureCopy:
+        "The board gathers all visible World Cup market data into one workflow so users can spot disagreement, avoid bad prices, and keep risk discipline before acting elsewhere.",
+      demoTitle: "Judge demo path",
+      demoSteps: ["Start at the landing page", "Open the live radar", "Inspect an opportunity", "Verify Walrus artifacts"],
+    },
     metrics: {
       totalMarkets: "Total Markets",
       volume24h: "24h Volume",

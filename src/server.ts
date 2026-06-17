@@ -3,7 +3,7 @@
 // 唯一的"写"入口是 AI 分析(结果落 ai_analysis 表)与 prompt 模板(meta 表)。
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { BOARD_PORT, BOARD_PORT_EXPLICIT, log } from "./config.js";
-import { boardPage, matchPage, opportunitiesPage, readWalrusManifest, reviewPage, walrusPage } from "./board/render.js";
+import { alertsPage, boardPage, landingPage, matchPage, opportunitiesPage, readWalrusManifest, reviewPage, walrusPage } from "./board/render.js";
 import { parseLocale } from "./board/i18n.js";
 import { getCurrentOdds } from "./queries/currentOdds.js";
 import { getSportteryEdges } from "./queries/sportteryAvoidance.js";
@@ -11,12 +11,13 @@ import { getOutrightBoard } from "./queries/outright.js";
 import { runHealthChecks } from "./queries/healthChecks.js";
 import { getLineHistory } from "./queries/lineHistory.js";
 import { getMarketRadar } from "./queries/marketIntelligence.js";
-import { getProbabilityCandidates } from "./queries/probabilityModel.js";
+import { getProbabilityCandidates, type ProbabilityModelResult } from "./queries/probabilityModel.js";
 import { getMatchEventBundle } from "./queries/matchEvents.js";
 import { aiProviderOptions, analyzeMatch, currentAiProvider, currentSystemPrompt, DEFAULT_SYSTEM_PROMPT, hasApiKey, type AiProviderOverride } from "./ai/analyze.js";
 import { analyzeBoardBettingPlan, boardPlanSystemPrompt, buildBoardBettingContext, latestBoardVerdict, planConstants, type BoardPromptLocale } from "./ai/boardPlan.js";
 import { listAnalyses, listWalrusPublishLog, setMeta, db, getMeta } from "./db.js";
 import { getOfferedOddsForFixtures } from "./queries/offeredOdds.js";
+import { walrusArtifactLinks } from "./walrusLinks.js";
 
 function html(res: ServerResponse, body: string): void {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -77,15 +78,69 @@ function boardPromptLocale(url: URL): BoardPromptLocale {
   return url.searchParams.get("lang") === "zh" ? "zh" : "en";
 }
 
+function walrusApiManifest(): Record<string, unknown> | null {
+  const manifest = readWalrusManifest();
+  if (!manifest) return null;
+  const network = String(manifest.walrus_network ?? manifest.network ?? getMeta("walrus_latest_network") ?? "testnet");
+  const artifacts = Array.isArray(manifest.artifacts)
+    ? (manifest.artifacts as Record<string, unknown>[]).map((artifact) => {
+        const walrus = artifact.walrus && typeof artifact.walrus === "object" ? (artifact.walrus as Record<string, unknown>) : {};
+        const blobId = typeof walrus.blob_id === "string" ? walrus.blob_id : null;
+        return {
+          ...artifact,
+          links: walrusArtifactLinks(blobId, network),
+        };
+      })
+    : [];
+  return { ...manifest, artifacts };
+}
+
+function compactFloat(value: number, digits = 6): number {
+  if (!Number.isFinite(value)) return value;
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function compactProbability(result: ProbabilityModelResult, maxCandidates = 300): Record<string, unknown> {
+  const candidates = result.candidates.slice(0, maxCandidates);
+  return {
+    compact: true,
+    candidateCount: result.candidates.length,
+    returnedCandidates: candidates.length,
+    omittedCandidates: Math.max(0, result.candidates.length - candidates.length),
+    candidates: candidates.map((candidate) => ({
+      fixtureKey: candidate.fixtureKey,
+      outcome: candidate.outcome,
+      platform: candidate.offeredOdd.platform,
+      source: candidate.offeredOdd.source,
+      decimalOdds: compactFloat(candidate.offeredOdd.decimalOdds, 4),
+      offeredProbability: compactFloat(candidate.marketImpliedProbability),
+      fairProbability: compactFloat(candidate.fairProbability),
+      marketImpliedProbability: compactFloat(candidate.marketImpliedProbability),
+      edgePp: compactFloat(candidate.edgePp, 3),
+      expectedValuePct: compactFloat(candidate.expectedValuePct, 4),
+      kellyFraction: compactFloat(candidate.kellyFraction),
+      score: compactFloat(candidate.score, 2),
+      sourceCount: candidate.sourceContributions.length,
+    })),
+    skipped: result.skipped.slice(0, 25),
+    skippedCount: result.skipped.length,
+  };
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const locale = parseLocale(url.searchParams.get("lang"));
 
   switch (url.pathname) {
     case "/":
+      return html(res, landingPage(locale));
+    case "/radar":
       return html(res, boardPage(locale));
     case "/opportunities":
       return html(res, opportunitiesPage(locale));
+    case "/alerts":
+      return html(res, alertsPage(locale));
     case "/review":
       return html(res, reviewPage(locale));
     case "/walrus":
@@ -97,8 +152,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     case "/api/radar":
       return json(res, getMarketRadar(intParam(url, "limit", 50, 70)));
-    case "/api/probability":
-      return json(res, getProbabilityCandidates(intParam(url, "limit", 70, 70), url.searchParams.get("fk")));
+    case "/api/probability": {
+      const fk = url.searchParams.get("fk");
+      const result = getProbabilityCandidates(intParam(url, "limit", 70, 70), fk);
+      const full = Boolean(fk) || url.searchParams.get("detail") === "full" || url.searchParams.get("compact") === "0";
+      return json(res, full ? result : compactProbability(result, intParam(url, "candidateLimit", 300, 1000)));
+    }
     case "/api/current":
       return json(res, getCurrentOdds(intParam(url, "limit", 12, 50)));
     case "/api/avoid":
@@ -108,20 +167,26 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     case "/api/health":
       return json(res, runHealthChecks());
     case "/api/walrus":
-      return json(res, {
-        latest: {
-          manifestBlobId: getMeta("walrus_latest_manifest_blob_id"),
-          manifestObjectId: getMeta("walrus_latest_manifest_object_id"),
-          publishedAt: getMeta("walrus_latest_published_at"),
-          network: getMeta("walrus_latest_network"),
-          schemaVersion: getMeta("walrus_latest_schema_version"),
-          error: getMeta("walrus_latest_error"),
-          artifactCount: getMeta("walrus_latest_artifact_count"),
-          totalBytes: getMeta("walrus_latest_total_bytes"),
-        },
-        manifest: readWalrusManifest(),
-        logs: listWalrusPublishLog(20),
-      });
+      {
+        const network = getMeta("walrus_latest_network") ?? "testnet";
+        const manifestBlobId = getMeta("walrus_latest_manifest_blob_id");
+        const manifestObjectId = getMeta("walrus_latest_manifest_object_id");
+        return json(res, {
+          latest: {
+            manifestBlobId,
+            manifestObjectId,
+            publishedAt: getMeta("walrus_latest_published_at"),
+            network,
+            schemaVersion: getMeta("walrus_latest_schema_version"),
+            error: getMeta("walrus_latest_error"),
+            artifactCount: getMeta("walrus_latest_artifact_count"),
+            totalBytes: getMeta("walrus_latest_total_bytes"),
+            links: walrusArtifactLinks(manifestBlobId, network),
+          },
+          manifest: walrusApiManifest(),
+          logs: listWalrusPublishLog(20),
+        });
+      }
     case "/api/ai/providers":
       return json(res, {
         current: currentAiProvider(),
@@ -194,7 +259,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return json(res, { system: boardPlanSystemPrompt(promptLocale), context: buildBoardBettingContext(fk, promptLocale) });
     }
     case "/api/board-plan/latest": {
-      const latest = latestBoardVerdict();
+      const latest = latestBoardVerdict(boardPromptLocale(url), url.searchParams.get("fk"));
       if (!latest?.verdict) return json(res, { latest: null, constants: planConstants() });
       const fixtureKeys = [...new Set(latest.verdict.recommendations.map((pick) => pick.fixture_key))];
       return json(res, { latest, offeredOdds: getOfferedOddsForFixtures(fixtureKeys), constants: planConstants() });
