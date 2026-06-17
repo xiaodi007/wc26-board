@@ -26,33 +26,35 @@ quick tunnel is the current workaround.
 
 ## Latest Deployment
 
-- Latest app rebuild/restart: 2026-06-13 17:10 CST
-- Deployed change: post-match review list UX with filters/sorting, expandable
-  three-part match reads, key-turn and platform-reaction tables, switchable
-  review trend charts, unified sidebar navigation, Walrus manifest display
-  cleanup, shared Sporttery edge thresholds, and transparent model-edge fields
-  in market intelligence.
+- Latest app rebuild/restart: 2026-06-13 21:00 CST
+- Deployed change: global matched-score display on match cards/review cards and
+  completed-match detail pages, winner/loser/draw semantic colors, highest 1X2
+  probability highlighting, mobile review-card overflow fix, and updated docs.
 - Public demo URL remains:
   `https://crossing-tide-extra-explicit.trycloudflare.com`.
 - Verification: `docker compose exec -T board npm exec tsc -- --noEmit` passed.
   `docker compose exec -T board npm run health` returned
   `9 pass, 1 warn, 0 fail`. The only warn remained Sporttery freshness:
-  the hourly job is deployed, but the VPS currently receives `HTTP 567` from
-  the official Sporttery endpoint. PM, Kalshi, and Odds API were fresh, and the
-  daemon will retry Sporttery hourly.
+  latest remote Sporttery snapshot was `2026-06-12T13:59:28.924Z`; PM, Kalshi,
+  and Odds API were fresh after restart.
 - `docker compose exec -T board npm run status` showed 142 source rows,
-  72 fixtures, PM fresh at 2026-06-13 09:10 UTC, Kalshi fresh at
-  2026-06-13 09:06 UTC, and next-24h matches available. Sporttery remained on
-  the prior remote snapshot `2026-06-12T13:59:28.924Z`.
-- Remote `.env` does not currently have `API_FOOTBALL_KEY`; `/review` therefore
-  shows the clear odds-only degradation. The daemon used The Odds API scores
-  fallback and upserted 4 `match_result` rows, but no goal-event timeline.
-- Internal API smoke passed: `/api/ai/providers` returned provider default
-  metadata; `/api/probability` returned candidates; `/api/match-events` returned
-  configured status.
-- Public quick-tunnel checks after deploy returned HTTP 200 for `/`,
-  `/?lang=en`, `/review?lang=zh`, `/walrus?lang=zh`, `/match?...&lang=zh`,
-  `/api/ai/providers`, `/api/probability?limit=1`, and `/api/match-events?...`.
+  72 fixtures, PM fresh at 2026-06-13 12:59 UTC, Kalshi fresh at
+  2026-06-13 12:59 UTC, Odds API fresh at 2026-06-13 12:39 UTC, and next-24h
+  matches available.
+- `docker compose exec -T board npm run results` exited 0. Sporttery score
+  fallback returned remote `HTTP 567 Unknown Status`; The Odds API scores
+  upserted `4/72` completed results.
+- Internal proxy smoke returned HTTP 200 for `/`, `/radar?lang=zh`,
+  `/review?lang=zh`, and
+  `/match?fk=united%20states%7Cparaguay%7C2026-06-13T01%3A02%3A00Z&lang=zh`.
+  The review and completed-match pages included `rv-card-score has-score`,
+  `match-result-center`, `result-winner`, `result-loser`, `result-draw`, and
+  `prob-leader` markers.
+- Public quick-tunnel checks returned HTTP 200 for `/`, `/radar?lang=zh`,
+  `/review?lang=zh`, and the same completed-match detail page. Public HTML
+  included the score/result and probability highlight markers.
+- Daemon logs confirmed the current startup line includes
+  `Sporttery every ... results every ... Walrus publish every ...`.
 
 The previous Walrus testnet compact publish from 2026-06-13 13:34 CST remains
 the latest recorded Walrus publish unless a new publish is run manually.
@@ -188,8 +190,8 @@ Common variables:
 - `KALSHI_POLL_MS`
 - `SPORTTERY_POLL_MS` (defaults to hourly polling)
 - `API_FOOTBALL_KEY` for scorelines and match events; if absent, review pages
-  clearly fall back to odds-only review, and The Odds API scores can provide
-  scorelines only
+  try Sporttery public scores first, then fall back to odds-only review; The
+  Odds API scores can provide scorelines only
 - `API_FOOTBALL_BASE` (defaults to `https://v3.football.api-sports.io`)
 - `RESULTS_POLL_MS` (defaults to 10 minutes)
 - `ODDSAPI_POLL_MS`
@@ -198,6 +200,8 @@ Common variables:
 - `WALRUS_*`; for one-off public testnet publishing, the verified public
   endpoints are `https://publisher.walrus-testnet.walrus.space` and
   `https://aggregator.walrus-testnet.walrus.space`
+- `WALRUS_PUBLISH_MS` for daemon compact-publish cadence when
+  `WALRUS_ENABLED=true` (defaults to 60 minutes)
 - `BOARD_PORT=4626`
 
 The current demo `.env` does not persist `WALRUS_PUBLISHER_URL`. For one-off
@@ -236,10 +240,13 @@ Expected current health state after the initial VPS deployment was:
 
 Also open the public tunnel URL and check:
 
-- home page renders in Chinese and English with `?lang=zh` / `?lang=en`
+- root landing page renders in English by default and Chinese with `?lang=zh`
+- live radar renders at `/radar` and `/radar?lang=en`
+- priority match cards show PM funding distribution or a clear unavailable state
 - `/review?lang=zh` loads the post-match odds replay page
 - match detail pages load
 - `/walrus?lang=zh` loads and `/api/walrus` shows latest manifest metadata
+  with aggregator JSON links and Walruscan links when blob ids exist
 - `/api/ai/providers` returns default provider metadata
 - `/api/probability?limit=1` returns candidates/skipped JSON
 - `/api/analyze-board?lang=zh` either returns a parsed plan when a provider key

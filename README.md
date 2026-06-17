@@ -1,212 +1,137 @@
-# wc26-board
+# WC Radar
 
-2026 世界杯赔率聚合 dashboard(**个人研究/本地只读**:只读聚合 + 分析,不下单、不托管公开运行实例;公开仓库只包含源码,不包含 `.env`、SQLite、日志或导出数据)。
+AI-assisted 2026 World Cup market intelligence for Overflow judges, football
+fans, and disciplined odds researchers.
 
-当前 demo VPS 部署细节见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+WC Radar aggregates match fixtures, bookmaker odds, prediction-market liquidity,
+Sporttery prices, line movement, post-match evidence, and Walrus snapshots into
+one local read-only board. It helps users compare prices, spot market
+disagreement, avoid obviously poor odds, and keep risk controls visible before
+acting elsewhere.
 
-当前状态:Phase G 完成 — 在 Phase F(AI 投注计划模拟:首页/单场页、真实可赔赔率、AI 估算概率、25% Kelly、收益/亏损/EV 计算、临时 API key 不保存、`/walrus` 数据页、摘要卡片 + 弹窗、prompt 默认英文并随 `?lang=zh` 切中文、premium market intelligence UI、Walrus sanitized public snapshot、fixture 归并、health split 检查、移动端溢出修复、board 端口回退)基础上,新增 `/review` 赛后赔率复盘页与完赛比分/进球事件采集(`match_result`/`match_event` 表、`/api/match-events`,赛果源支持 API-Football 进球事件或 The Odds API scores 比分兜底)。导航统一为单侧栏,英文页文案已无残留中文。
-Phase D 同步完成:Polymarket `participants` 不再显示为全市场人数,改为 `PM active traders 24h` 与 `Top holder depth`;`liquidity` 使用 Gamma market 字段,holder/trade 数据失败时降级且 sampled 可见。
-体彩竞彩保持**手动低频抓取/导入**,不进 daemon 高频轮询。AI 一键分析可在 `.env` 通过 `AI_PROVIDER` 选择 `anthropic` / `deepseek` / `kimi` / `openai-compatible`(不配 key 则降级为 prompt 预览+复制);告警推送需配 `SERVERCHAN_KEY`(不配则只落库、页面可见)。
+中文简述:这是一个 2026 世界杯赔率与预测市场聚合雷达，强调 Walrus 可验证数据层、AI 辅助分析、赛后复盘和风险纪律；不执行下注、不托管资金、不承诺收益。
 
-## 快速开始
+## What Judges Should See First
+
+- Landing page at `/`: product narrative, live metrics, current match radar, and
+  direct demo path.
+- Live radar at `/radar`: upcoming and live World Cup matches, multi-source
+  odds, market disagreement, Sporttery avoid/value signals, alerts, and data
+  health. Match cards show final scores when a result has been matched.
+- Alerts at `/alerts`: recent price jumps, Sporttery edge/avoid alerts, health
+  alerts, 24h alert count, ServerChan status, and the daily push cap.
+- Opportunities at `/opportunities`: ranked market opportunities with liquidity,
+  probability gaps, risk tags, and model transparency.
+- Walrus page at `/walrus`: sanitized public snapshots, manifest metadata,
+  artifact hashes, aggregator links, Walruscan links, and public AI digest.
+- Review page at `/review`: post-match odds replay from 24 hours before kickoff
+  through the live window, with scorelines and event context when available.
+  Winners are marked green, losers red, and draws neutral/amber.
+
+The current demo deployment is a temporary Cloudflare tunnel. See
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the latest runbook and URL.
+
+## Why It Matters
+
+World Cup markets are fragmented. Users often need to compare traditional books,
+prediction markets, local Sporttery prices, and live market movement manually.
+WC Radar puts those signals into one workflow:
+
+- Aggregates Polymarket, Kalshi, The Odds API, Pinnacle-derived consensus,
+  Sporttery HAD/HHAD, match results, and optional goal events.
+- Normalizes each match into a canonical fixture so slightly different source
+  kickoff times do not split the same game.
+- Highlights disagreement between platforms, market freshness, liquidity depth,
+  active-trader signals, and top-holder concentration.
+- Highlights the highest 1X2 probability in each probability group without
+  using loser-red styling for prediction-only information.
+- Adds AI match analysis and bankroll-aware betting-plan simulation without
+  storing user API keys, bankroll, or stake amounts.
+- Publishes only sanitized aggregate snapshots to Walrus, not raw databases,
+  credentials, wallets, private configuration, or user bankroll data.
+
+## Walrus / Overflow Story
+
+WC Radar uses Walrus as the public, verifiable data layer for a sports market
+intelligence app:
+
+- `npm run export:walrus` writes aggregate-only JSON snapshots.
+- `npm run publish:walrus:testnet` or `npm run publish:walrus:testnet:compact`
+  publishes a manifest and artifacts through a Walrus publisher.
+- The board displays manifest blob ids, schema, artifact hashes, publish logs,
+  aggregator JSON links, and Walruscan links.
+- Public snapshots include market metrics, risk signals, source freshness,
+  opportunity rankings, and public AI summaries.
+
+The positioning is: AI-assisted sports market intelligence plus verifiable
+off-chain data snapshots.
+
+## AI Betting Assistance
+
+The AI flow is decision support, not automated betting:
+
+- Users can generate a board-level or match-level betting simulation.
+- Temporary provider settings and API keys are accepted in the browser dialog
+  for one request only and are not written to `.env`, SQLite, logs, or Walrus.
+- The model estimates probabilities, reasoning, risks, and cancellation
+  conditions.
+- Local code calculates stake sizing with a 25% Kelly fraction, a 1% bankroll
+  single-bet cap, offered odds, expected value, potential net profit, and maximum
+  loss.
+- The no-key fallback still exposes a transparent prompt for manual review.
+
+This project does not place bets, route orders, custody funds, guarantee profit,
+or guarantee a higher win rate.
+
+## Quick Start
 
 ```bash
 npm install
-cp .env.example .env        # 填 ODDS_API_KEY(the-odds-api.com 免费注册;不填则纯 Polymarket 模式)
-npm run bootstrap           # 建库 + 赛程导入 + 首轮快照
-npm run status              # 体检
-npm run health              # Phase A 健康检查(失败时非 0 exit)
-npm run current             # 查看下一批比赛的三向归一概率(home/draw/away)
-npm run board               # 决策 board:默认 http://127.0.0.1:4626;占用时自动尝试 4627-4636
-npm run avoid:sporttery     # 体彩相对国际盘概率偏高的避坑排行
-npm run fetch:sporttery     # 低频手动抓取中国竞彩 HAD/HHAD
-npm run import:sporttery -- data/imports/sporttery.csv # 半自动导入竞彩胜平负 SP
-npm run export:walrus       # 生成 sanitized Walrus JSON 快照到 data/walrus-feed/
-npm run publish:walrus:testnet # 使用 WALRUS_PUBLISHER_URL 发布快照 manifest 到 Walrus testnet
-npm run publish:walrus:testnet:compact # 发布 daemon 同款 compact feed(radar/opportunities/AI digest/manifest)
-bash bin/install-launchd.sh # 常驻采集(launchd KeepAlive)
-tail -F logs/daemon.log
+cp .env.example .env
+npm run bootstrap
+npm run status
+npm run health
+npm run board
 ```
 
-## 当前能力
+The board binds to `127.0.0.1:4626` by default and automatically tries
+`4627-4636` if the default port is occupied.
 
-- SQLite 本地库: `event / market / outcome / snapshot / meta`,snapshot 只追加;`event.fixture_key` 用于跨源合并同一场比赛。同队同日且开球时间相差不超过 45 分钟的源事件会统一到 canonical fixture,优先书商/OddsAPI 赛程,其次 Polymarket,避免 `USA vs Paraguay` 这类 2 分钟偏差拆成两场。
-- Polymarket:daemon 默认 5min 抓冠军盘 + 单场主三元;严格过滤 `fifwc-{home}-{away}-{date}` 主事件,跳过 props/半场/比分等衍生盘。
-- Kalshi:daemon 默认 5min 抓冠军盘(`KXMENWORLDCUP-26`,48 队二元)+ 单场系列(`KXWCGAME`,两队+TIE 三个二元);公开行情接口无需鉴权,按队名+赛日挂到现有 fixture,不造孤立 event。
-- The Odds API:有 key 时按免费层约 90min 抓欧洲区 `h2h` 书商 1X2;配额写入 `meta`,由 `npm run status` 显示。
-- 体彩竞彩:用官方计算器公开 JSON 接口手动低频抓 `HAD`/`HHAD`;如果被 WAF 拦截,退回本地 CSV/JSON 导入。
-- 当前读层: `npm run current` 输出下一批比赛的 Polymarket / Kalshi / Pinnacle / 体彩 HAD / 书商中位三向归一概率。
-- 避坑指数: `npm run avoid:sporttery` 输出体彩 HAD 隐含概率高于国际书商共识的选项,用于识别相对不划算方向,不是投注建议。
-- 决策 board: `npm run board` 起本地只读页面(默认 127.0.0.1:4626;默认端口占用时自动尝试 4627-4636)——premium dark market radar,支持 `?lang=zh|en`,导航统一走左侧栏;首页显示 AI 投注计划卡片、PM liquidity、24h active traders、top holder depth、机会榜、AI Brief、Walrus Proof;详情页显示本场投注计划卡片、match hero、多平台 odds、PM market metrics、price trend、team basics、risk panel;`/review` 赛后复盘页按开赛前 24h~开赛后 2.5h 固定窗口回放各源概率,并用比分/进球时间解释市场转折(无 `API_FOOTBALL_KEY` 时降级为纯赔率复盘)。
-- Polymarket market intelligence:Gamma `liquidityNum/liquidityClob`、`volume24hr/volumeNum`、`spread`、`lastTradePrice`、`conditionId` 落库;Data API `/holders` 只作为 top-holder depth/concentration,`/trades` 只作为 24h active traders/trade count,永不包装成 total participants。
-- AI 投注计划:首页 `/` 和单场 `/match` 显示摘要卡片,点击弹窗后可输入临时 bankroll/max daily loss/provider/base/model/key,直接生成投注模拟;AI 只输出估算概率、理由、风险和撤销条件,系统本地按 25% Kelly、单注 1% 本金上限、最大日亏损上限计算 stake、潜在净收益、最大亏损和 EV。临时 API key、本金和下注金额不写 `.env`、DB、日志或 Walrus。复制/调用 board betting prompt 时默认英文,`?lang=zh` 时切中文。
-- Walrus public data feed:`npm run export:walrus` 导出 aggregate-only JSON(`radar-latest.json`,`opportunities-latest.json`,`ai-board-latest.json`,`matches/*.json`,`manifest-latest.json`);`npm run publish:walrus:testnet` 可通过 publisher 上传并把最新 manifest blob 写入 `meta` 供 UI 显示;`/walrus` 展示最新 manifest/artifacts/blob/log,提供可打开的 blob/API 链接和本地 JSON 数据预览。
-- LIVE: 开球后 2.5h 内场次不消失——主页置顶「进行中」(LIVE 徽标+已比分钟数),体彩标注已停售并退出避坑比价;PM/Kalshi 盘中实时概率照常流入。
-- 告警: daemon 每分钟检测**主力源盘口突变(≥3pp)**、**体彩 vs 共识新条目**、**health FAIL**,`alert_log` 表 UNIQUE 去重;配 `SERVERCHAN_KEY` 后合并成一条微信推送(免费配额小,绝不一事一推,另有 `ALERT_MAX_PER_DAY` 日上限,默认 5);Server酱请求用独立直连 Agent 绕开 HTTPS_PROXY。
-- AI 分析: 详情页一键生成结构化解读(倾向/信号/风险/体彩视角),prompt 透明可编辑,分析历史落库;调用层可插拔,默认 Anthropic,也支持 DeepSeek/Kimi/其它 OpenAI-compatible `/chat/completions`;数据组装为 ~1.5k tokens 高密度上下文(归一概率、预计算价差、关键点走势、夺冠锚、新鲜度)。
+Useful commands:
 
-## 命令
-
-| 命令 | 作用 |
-|---|---|
-| `npm run bootstrap` | 建库,导入 Odds API 赛程/书商盘,抓 Polymarket 冠军盘 + 单场盘 |
-| `npm run poll` | 手动跑一轮 Polymarket/OddsAPI 采集 |
-| `npm run daemon` | 前台跑常驻采集进程 |
-| `bash bin/install-launchd.sh` | 安装 macOS launchd KeepAlive daemon |
-| `npm run board` | 本地只读决策 board(默认 http://127.0.0.1:4626;默认端口占用时自动尝试 4627-4636) |
-| `npm run status` | 查看事件/fixture 数、各源快照量、最新时间、API 配额 |
-| `npm run health` | 健康检查:fixture key、近似同场 split、覆盖率、PM/Kalshi 延迟、OddsAPI/体彩新鲜度 |
-| `npm run current -- --limit=8` | 查看当前三向归一概率(home/draw/away) |
-| `npm run avoid:sporttery -- --limit=20 --threshold=2` | 体彩 HAD 相对国际书商均值偏高的避坑排行 |
-| `npm run fetch:sporttery` | 手动抓取官方竞彩计算器 HAD/HHAD |
-| `npm run import:sporttery -- <file>` | 从本地 CSV/JSON 导入竞彩 HAD 兜底数据 |
-| `npm run export:walrus` | 导出 sanitized public JSON 快照到 `data/walrus-feed/` |
-| `npm run publish:walrus:testnet` | 发布 Walrus feed;需 `.env` 配 `WALRUS_PUBLISHER_URL` |
-| `npm run publish:walrus:testnet:compact` | 发布 compact feed,与 daemon 每轮采集后的发布路径一致 |
-
-## Walrus / Overflow 数据层
-
-Walrus feed 是公开、可验证的数据快照,用于 hackathon/demo 的 data layer 叙事,不是把本地数据库直接公开。
-
-- 发布内容:聚合后的 match/opportunity/market metrics、risk signals、sampled flags、source freshness、公共 AI 摘要、schema/version/hash。
-- 不发布内容:API keys、私钥、完整 SQLite、raw holder wallet addresses、个人配置、用户 bankroll、下注金额。
-- 默认目录:`data/walrus-feed/`(已 gitignore)。
-- schema:`wc26.market_radar.v1`。
-- testnet 发布:设置 `WALRUS_PUBLISHER_URL` 后运行 `npm run publish:walrus:testnet`;compact 路径可用 `npm run publish:walrus:testnet:compact`;成功后 UI 的 `Walrus Proof` 和 `/walrus` 面板展示最新 manifest blob/network/schema/published time/artifact log。
-- Overflow 定位:优先按 Walrus Specialized Track 讲“AI-assisted sports market intelligence + verifiable off-chain data snapshots”;投注计划只作为概率模拟展示,不执行下注。
-
-## AI provider 配置
-
-详情页 AI 分析和首页/单场 AI 投注计划默认走 Anthropic,保持旧 `.env` 兼容;大陆环境可把 `AI_PROVIDER` 切到 DeepSeek/Kimi/其它 OpenAI-compatible 服务。无 key 时页面仍展示完整 prompt,可复制到任意 AI 手动使用。页面也支持在 AI Betting Plan 弹窗里临时输入 provider/base/model/API key 直接调用;临时 key 只随本次请求进入内存,不保存。Board betting prompt 的默认语言是英文,只有显式 `?lang=zh` 时使用中文 system/context prompt。
-
-| provider | `AI_PROVIDER` | 默认 base | 默认模型 | key |
-|---|---|---|---|---|
-| Anthropic | `anthropic` | `https://api.anthropic.com` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
-| DeepSeek | `deepseek` | `https://api.deepseek.com` | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
-| Kimi/Moonshot | `kimi` | `https://api.moonshot.cn/v1` | `kimi-k2.6` | `KIMI_API_KEY` 或 `MOONSHOT_API_KEY` |
-| 通用兼容口 | `openai-compatible` | 必填 | 必填 | `OPENAI_COMPAT_API_KEY` 或 `OPENAI_API_KEY` |
-
-DeepSeek thinking 可用 `DEEPSEEK_THINKING=on`,此时默认切到 `DEEPSEEK_THINKING_MODEL=deepseek-v4-pro` 并带 `reasoning_effort=high`。Kimi 默认 `KIMI_DEFAULT_TEMPERATURE=1`,避免 K2 系列拒绝任意温度值。分析结果的 `model` 字段会以 `provider:model` 形式写入 `ai_analysis`,方便回看不同模型输出。
-
-AI 投注计划使用真实可赔赔率计算收益:优先 Sporttery 原始 SP,其次 Polymarket/Kalshi ask/last,再用 OddsAPI decimal 书商价;不会用归一概率倒推收益。默认 Kelly fraction 为 25%,单注上限为 bankroll 的 1%,并受用户输入的最大日亏损上限约束。
-
-DeepSeek 示例:
-
-```env
-AI_PROVIDER=deepseek
-DEEPSEEK_API_KEY=...
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_CHAT_MODEL=deepseek-v4-flash
+```bash
+npm run current -- --limit=8
+npm run avoid:sporttery -- --limit=20 --threshold=2
+npm run results
+npm run fetch:sporttery
+npm run import:sporttery -- data/imports/sporttery.csv
+npm run export:walrus
+npm run publish:walrus:testnet:compact
 ```
 
-Kimi 示例:
+## Documentation
 
-```env
-AI_PROVIDER=kimi
-KIMI_API_KEY=...
-KIMI_BASE_URL=https://api.moonshot.cn/v1
-KIMI_CHAT_MODEL=kimi-k2.6
-KIMI_DEFAULT_TEMPERATURE=1
-```
+- [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md): local setup, commands,
+  board startup, and provider-key fallback.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): schema, data flow, fixture
+  merge, polling/read layer, and server-rendered board.
+- [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md): Polymarket, Kalshi, The Odds
+  API, Sporttery, score/event fallbacks, freshness, and compliance boundaries.
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md): VPS/Docker/Cloudflare tunnel
+  runbook and post-deploy smoke checks.
+- [`docs/WALRUS.md`](docs/WALRUS.md): sanitized feed, manifest/artifacts,
+  publish/read flow, and Overflow narrative.
+- [`docs/AI_BETTING_PLAN.md`](docs/AI_BETTING_PLAN.md): AI providers, temporary
+  keys, Kelly simulation, offered odds, and risk controls.
+- [`docs/REVIEW_CHECKLIST.md`](docs/REVIEW_CHECKLIST.md): pre-commit and public
+  repo checks.
 
-其它 OpenAI-compatible 示例:
+## Safety Boundary
 
-```env
-AI_PROVIDER=openai-compatible
-OPENAI_COMPAT_API_KEY=...
-OPENAI_COMPAT_BASE_URL=https://example.com/v1
-OPENAI_COMPAT_MODEL=your-chat-model
-```
+This is a local read-only research and demo app. The public repository should
+contain source code and documentation only. Do not commit `.env`, SQLite
+databases, logs, raw imports, or generated Walrus feed files.
 
-## 数据源
-
-| 源 | 认证 | 频率 | 内容 |
-|---|---|---|---|
-| Polymarket Gamma | 无需 | 5min | 冠军盘(60 队二元)+ 单场主三元(series `soccer-fifwc` id=11433,每场 3 个 moneyline 二元:主胜/客胜/平局) |
-| Kalshi | 无需(公开行情) | 5min | 冠军盘 `KXMENWORLDCUP-26`(48 队二元)+ 单场 series `KXWCGAME`(每场两队+TIE 三个二元) |
-| The Odds API | key(免费 500/月) | 90min(免费层) | 书商 1X2,欧洲区;credit=市场数×地区数 |
-| 体彩竞彩 | 官方公开计算器接口/手工 CSV | 手动低频 | 胜平负 HAD + 让球胜平负 HHAD |
-| 赛果/事件 | API-Football key(可选) | 10min | 比分与进球事件;未配 key 时用 The Odds API scores 仅补比分 |
-
-## 体彩接入
-
-`npm run fetch:sporttery` 调用中国竞彩网足球胜平负计算器页面使用的公开 JSON 接口:
-
-- 页面:`https://www.sporttery.cn/jc/jsq/zqspf/`
-- 数据:`https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c&poolCode=hhad%2Chad`
-- 写库:`source='sporttery'`;`market_type='sporttery_had'` 或 `sporttery_hhad`
-- HAD 用于 `npm run current` 的 `sporttery` 列;HHAD 先入库,后续单独做让球视图/避坑指数。
-
-边界:只手动低频触发,不登录,不绕验证码/签名/WAF,不代理池,不并发,不接入 daemon 高频轮询。如果接口被 WAF 拦截,退回手工文件导入。
-
-把手工导出的文件放到 `data/imports/` 后运行 `npm run import:sporttery -- data/imports/sporttery.csv`。CSV 表头支持英文或常见中文名:
-
-```csv
-home_team,away_team,kickoff_local,home_win,draw,away_win,match_id
-Canada,Bosnia & Herzegovina,2026-06-13 03:00,1.91,3.68,4.92,had-001
-```
-
-也支持 `主队,客队,比赛时间,胜,平,负,场次`。无时区的比赛时间按北京时间解析;JSON 输入可为数组,或包含 `matches`/`data`/`rows` 数组的对象。
-
-## 体彩避坑指数
-
-`npm run avoid:sporttery -- --limit=20 --threshold=2` 只读本地库,比较体彩 HAD 三向归一概率与国际书商共识(`book_avg`,自 Phase B 起为**中位数**——实测单家书商会出现 ±37pp 的离群/过期盘,均值会被拖偏)。
-
-- `diff_pp = (sporttery_prob - book_avg_prob) * 100`
-- 默认只显示 `diff_pp >= 2.0` 且国际书商数 `books >= 5` 的选项。
-- outcome 显示为主队名 / `draw` / 客队名,避免误读 home/away。
-- 这个排行表示“体彩隐含概率相对偏高、回报相对不划算”,不是下注建议。
-
-## 实测备注
-
-- 主事件 ticker `fifwc-{home}-{away}-{date}`;带后缀的是子事件(Player Props/Halftime/Exact Score 等),必须按严格 ticker 正则过滤,否则污染 event 表
-- 三个二元价加总 ≈1.015(独立交易的 overround),三向归一(multiplicative)放读取层
-- 体彩官方接口返回中文队名;`teams.ts` 维护中文别名,用于合并到现有英文 fixture。
-- **launchd 不继承 shell 代理变量**:HTTPS_PROXY 必须写进 `.env`,大陆直连 gamma-api 高频 HTTP 000
-- Kalshi 价格字段已迁移为 `*_dollars` 字符串(`response_price_units=usd_cent`),旧整数 cent 字段不再返回;冠军盘 series `KXMWORLDCUP` 是空壳,正确的是 `KXMENWORLDCUP`;单场 API 不给精确 kickoff,按队名+赛日±1 天匹配现有 fixture。
-- 部分源开球时间会有 2-30 分钟偏差;启动/写入时会把同队同日 45 分钟内事件归并到一个 canonical `fixture_key`,health 会 fail 任何未来 split。
-
-## 设计要点(来源:三模型讨论,raw 在 sui-research/sources/raw/wc26-*-2026-06-12.md)
-
-- 4+1 表 schema:event / market / outcome / snapshot / meta;snapshot 只追加,存原始价+隐含概率,devig 在读取层
-- 跨源同场比赛用 `fixture_key = normalized(home)|normalized(away)|kickoff_utc` 对齐;source event id 保留原样。由于源之间 kickoff 可能有分钟级偏差,同队同日 45 分钟内事件会统一到 canonical key(书商/OddsAPI 优先,其次 Polymarket)。
-- 大陆直连 PM 链路偶发 HTTP 000:所有请求 3 次重试+退避,单源故障不拖垮整轮
-- 球队名归一:normalize + 别名表 + 包含兜底;unmatched 必打日志
-- Odds API 配额硬保护:间隔不到 80% 不发请求;配额余量记录在 meta 表(`npm run status` 可见)
-
-## 后续阶段
-
-- Phase A 观测:跑满 24h 增长验证,按 unmatched/health 输出继续补队名别名和源覆盖。这是剩余观测项,不是功能缺口。
-- ~~Kalshi 接入~~:已完成(冠军盘 + 单场,daemon 5min)。
-- ~~Phase B 决策 dashboard~~:已完成(`npm run board`):比赛卡片流(共识条 + 体彩 diff 着色 + sparkline)、避坑/划算双榜、夺冠 Top10(PM vs Kalshi 互证)、详情页全源表 + 48h 三向走势 + HHAD、health 摘要;书商共识用中位数抗离群。
-- ~~Phase B AI 分析面板~~:已完成:`src/ai/context.ts` 组装高密度上下文,`src/ai/analyze.ts` 通过 provider registry 调 Anthropic 或 OpenAI-compatible 口(DeepSeek 默认 `https://api.deepseek.com` + `deepseek-v4-flash`;Kimi 默认 `https://api.moonshot.cn/v1` + `kimi-k2.6`;`.env` 可覆盖),结果落 `ai_analysis` 表;模板存 meta 可在页面编辑;无 key 降级为复制 prompt。**待办:配任一 provider key 后跑一次真实调用验证。**
-- ~~Phase C~~:已完成:HHAD 让球盘主页面板、Server酱告警(实测推送+去重通过)、LIVE 进行中场次(待 6/13 凌晨开赛实测观感)。
-- ~~Phase D/E~~:已完成:PM market intelligence、active traders/top-holder 口径修正、premium radar UI、中英文切换、Walrus sanitized feed、fixture split 修复、health 覆盖和 board 端口回退。
-- ~~Phase F~~:已完成:AI 投注计划模拟、真实可赔赔率读层、25% Kelly 收益/亏损/EV 计算、摘要卡片 + 弹窗交互、prompt 默认英文/中文切换、临时 key 不保存、Walrus compact feed 与 `/walrus` 数据预览页面。真实 AI provider smoke call 需要在运行环境补齐 provider key 后执行。
-- ~~Phase G 赛后复盘 + 完赛比分~~:已完成:`/review` 赛后赔率复盘页(开赛前 24h~开赛后 2.5h 固定窗口走势)、`match_result`/`match_event` 表与 `/api/match-events`、API-Football 进球事件源、The Odds API scores 比分兜底;未配 `API_FOOTBALL_KEY` 时清晰降级为纯赔率复盘。导航去重(单侧栏)、英文页残留中文清理、Walrus artifact 文件名解码显示。
-- 后续候选:AI 批量分析当日场次(早报)、让球盘公平概率建模(由 1X2 推导,需进球模型)。
-
-## 交接检查清单
-
-- `npm exec tsc -- --noEmit` 通过。
-- `npm run health` 无 FAIL;WARN 可接受但必须能解释(例如 OddsAPI 配额低频、体彩手动低频);必须包含 approximate fixture merge check。
-- `npm run status` 可查看 source/fixture/snapshot/API 配额状态。
-- `npm run current -- --limit=4` 可正常读取下一批比赛三向概率。
-- `npm run avoid:sporttery` 可输出体彩 HAD 相对国际书商均值偏高的排行。
-- `env AI_PROVIDER=deepseek DEEPSEEK_API_KEY=dummy node --import tsx -e 'const m = await import("./src/ai/analyze.ts"); console.log(m.currentAiProvider())'` 可看到 DeepSeek 默认 base/model,且不发外部请求。
-- `git diff --check` 无空白错误。
-- 只读 SQL 确认:`event.fixture_key` 无空值、无孤立 `sporttery-*` event、近似同场 split 为 0、Polymarket 单场 fixture 覆盖约 70、snapshot 行数持续增长。
-- 浏览器检查:桌面/移动端 `?lang=zh|en` 首页、机会页、详情页、`/walrus` 无 console error;英文页无残留中文 UI 文案;390px 宽度无整页横向滚动。
-- Public repo 前检查:`.env`、SQLite、logs、`data/walrus-feed/` 均被 ignore;tracked 文件中无真实 key/token/private key。
-
-## 推荐提交摘要
-
-推荐 commit title:`Phase E+: review, fixture merge, docs, and public repo prep`
-
-- fixture:近似开球时间 canonical merge,health split 检查,current/board 去重。
-- board:英文 UI 文案补齐、移动端溢出修复、默认端口自动回退。
-- docs:README 与 `docs/REVIEW_CHECKLIST.md` 更新,Public repo 前敏感信息边界确认。
-
-## 合规边界
-
-源码可公开;运行实例、`.env`、SQLite、日志、raw 导入和 Walrus 本地导出数据不公开提交。不执行下注、不代购、不保存个人资金配置;AI 投注计划是概率模型模拟,不构成金融建议或收益承诺。体彩接口只做公开页面同源数据的低频读取;不登录、不绕验证码/签名/WAF、不代理池、不自动化高频抓取。
+Sporttery ingestion is low-frequency/manual and uses public calculator data or
+local imports. The project does not log in, bypass CAPTCHA/signatures, use proxy
+pools, or run high-frequency automated Sporttery scraping.
