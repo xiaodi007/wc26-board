@@ -23,7 +23,7 @@ Hard rules:
 
 Output must be a valid JSON object, with no Markdown code fence. Keep these field names exactly for compatibility; write the text values in English:
 {
-  "summary_zh": "Two or three sentences summarizing the overall approach",
+  "summary": "Two or three sentences summarizing the overall approach",
   "recommendations": [
     {
       "fixture_key": "must come from the input",
@@ -58,7 +58,7 @@ export const DEFAULT_BOARD_PLAN_PROMPT_ZH = `你是一名足球赔率交易研�
 
 输出必须是合法 JSON object,不要使用 Markdown 代码块,字段:
 {
-  "summary_zh": "两三句话总结当前总体打法",
+  "summary": "两三句话总结当前总体打法",
   "recommendations": [
     {
       "fixture_key": "必须来自输入",
@@ -103,7 +103,7 @@ export interface BoardPlanAvoidItem {
 }
 
 export interface BoardBettingVerdict {
-  summary_zh: string;
+  summary: string;
   recommendations: AiBetPlanPick[];
   watchlist: BoardPlanWatchItem[];
   avoid: BoardPlanAvoidItem[];
@@ -284,10 +284,10 @@ function stripJsonFence(raw: string): string {
 
 export function parseBoardVerdict(raw: string): BoardBettingVerdict | null {
   try {
-    const parsed = JSON.parse(stripJsonFence(raw)) as BoardBettingVerdict;
+    const parsed = JSON.parse(stripJsonFence(raw)) as BoardBettingVerdict & { summary_zh?: string };
     if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.recommendations)) return null;
     return {
-      summary_zh: String(parsed.summary_zh ?? ""),
+      summary: String(parsed.summary ?? parsed.summary_zh ?? ""),
       recommendations: (parsed.recommendations ?? []).filter((r) => LABELS.includes(r.outcome)).slice(0, 8),
       watchlist: (parsed.watchlist ?? []).filter((r) => LABELS.includes(r.outcome)).slice(0, 12),
       avoid: (parsed.avoid ?? []).filter((r) => LABELS.includes(r.outcome)).slice(0, 12),
@@ -299,8 +299,8 @@ export function parseBoardVerdict(raw: string): BoardBettingVerdict | null {
   }
 }
 
-export function latestBoardVerdict(): { row: AiBoardAnalysisRow; verdict: BoardBettingVerdict | null } | null {
-  const row = listBoardAnalyses(1)[0];
+export function latestBoardVerdict(locale?: BoardPromptLocale, fixtureKey?: string | null): { row: AiBoardAnalysisRow; verdict: BoardBettingVerdict | null } | null {
+  const row = listBoardAnalyses({ locale, fixtureKey, limit: 1 })[0];
   return row ? { row, verdict: parseBoardVerdict(row.response) } : null;
 }
 
@@ -321,12 +321,20 @@ export async function analyzeBoardBettingPlan(args: {
   override?: AiProviderOverride;
   locale?: BoardPromptLocale;
 }): Promise<BoardBettingPlanOutcome> {
-  const systemPrompt = boardPlanSystemPrompt(args.locale ?? "en");
-  const context = buildBoardBettingContext(args.fixtureKey, args.locale ?? "en");
+  const locale = args.locale ?? "en";
+  const systemPrompt = boardPlanSystemPrompt(locale);
+  const context = buildBoardBettingContext(args.fixtureKey, locale);
   const result = await callProvider(systemPrompt, context.prompt, args.override);
   const verdict = parseBoardVerdict(result.raw);
   const storedRaw = verdict ? JSON.stringify(verdict) : result.raw;
-  const id = insertBoardAnalysis(result.model, systemPrompt, context.prompt, storedRaw);
+  const id = insertBoardAnalysis({
+    locale,
+    fixtureKey: args.fixtureKey ?? null,
+    model: result.model,
+    systemPrompt,
+    userPrompt: context.prompt,
+    response: storedRaw,
+  });
   const plan = verdict ? buildPlanFromVerdict(verdict, context.offeredOdds, args.bankroll, args.maxDailyLoss) : null;
   return { id, model: result.model, verdict, raw: storedRaw, context, plan };
 }

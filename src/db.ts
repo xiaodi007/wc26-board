@@ -86,6 +86,8 @@ CREATE INDEX IF NOT EXISTS idx_ai_analysis_fixture ON ai_analysis(fixture_key, t
 CREATE TABLE IF NOT EXISTS ai_board_analysis (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT DEFAULT (datetime('now')),
+  locale TEXT DEFAULT 'en',
+  fixture_key TEXT,
   model TEXT,
   system_prompt TEXT,
   user_prompt TEXT NOT NULL,
@@ -162,9 +164,27 @@ function ensureColumn(table: string, column: string, definition: string): void {
 
 ensureColumn("event", "fixture_key", "TEXT");
 ensureColumn("market", "condition_id", "TEXT");
+ensureColumn("ai_board_analysis", "locale", "TEXT DEFAULT 'en'");
+ensureColumn("ai_board_analysis", "fixture_key", "TEXT");
 db.exec("CREATE INDEX IF NOT EXISTS idx_event_fixture_key ON event(fixture_key)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_market_event_source ON market(event_id, source)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_market_event_type ON market(event_id, market_type)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_ai_board_analysis_scope ON ai_board_analysis(locale, fixture_key, ts)");
+db.prepare(
+  `UPDATE ai_board_analysis
+   SET locale='en'
+   WHERE locale IS NULL OR locale=''`
+).run();
+db.prepare(
+  `UPDATE ai_board_analysis
+   SET locale='zh'
+   WHERE system_prompt LIKE '你是一名%' OR system_prompt LIKE '%中文投注参考计划%'`
+).run();
+const stmtBackfillBoardFixtureKey = db.prepare(`UPDATE ai_board_analysis SET fixture_key=? WHERE id=?`);
+for (const row of db.prepare(`SELECT id, user_prompt FROM ai_board_analysis WHERE fixture_key IS NULL OR fixture_key=''`).all() as { id: number; user_prompt: string }[]) {
+  const keys = [...row.user_prompt.matchAll(/^###\s+(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+  if (keys.length === 1) stmtBackfillBoardFixtureKey.run(keys[0], row.id);
+}
 
 interface EventFixtureRow {
   id: string;
@@ -221,12 +241,14 @@ const stmtEventsWithSources = db.prepare(
 );
 const stmtUpdateFixtureKey = db.prepare(`UPDATE event SET fixture_key=? WHERE id=?`);
 const stmtUpdateAnalysisFixtureKey = db.prepare(`UPDATE ai_analysis SET fixture_key=? WHERE fixture_key=?`);
+const stmtUpdateBoardAnalysisFixtureKey = db.prepare(`UPDATE ai_board_analysis SET fixture_key=? WHERE fixture_key=?`);
 
 function syncFixtureKey(row: EventFixtureRow, nextKey: string): void {
   const prevKey = row.fixture_key;
   if (prevKey !== nextKey) {
     stmtUpdateFixtureKey.run(nextKey, row.id);
     if (prevKey) stmtUpdateAnalysisFixtureKey.run(nextKey, prevKey);
+    if (prevKey) stmtUpdateBoardAnalysisFixtureKey.run(nextKey, prevKey);
     row.fixture_key = nextKey;
   }
 }
@@ -586,10 +608,7 @@ const stmtListAnalyses = db.prepare(
   `SELECT * FROM ai_analysis WHERE fixture_key=? ORDER BY ts DESC, id DESC LIMIT ?`
 );
 const stmtInsertBoardAnalysis = db.prepare(
-  `INSERT INTO ai_board_analysis (model, system_prompt, user_prompt, response) VALUES (?, ?, ?, ?)`
-);
-const stmtListBoardAnalyses = db.prepare(
-  `SELECT * FROM ai_board_analysis ORDER BY ts DESC, id DESC LIMIT ?`
+  `INSERT INTO ai_board_analysis (locale, fixture_key, model, system_prompt, user_prompt, response) VALUES (?, ?, ?, ?, ?, ?)`
 );
 
 export function insertAnalysis(fixtureKey: string, model: string, systemPrompt: string, userPrompt: string, response: string): number {
@@ -603,18 +622,45 @@ export function listAnalyses(fixtureKey: string, limit = 5): AiAnalysisRow[] {
 export interface AiBoardAnalysisRow {
   id: number;
   ts: string;
+  locale: "zh" | "en" | string | null;
+  fixture_key: string | null;
   model: string | null;
   system_prompt: string | null;
   user_prompt: string;
   response: string;
 }
 
-export function insertBoardAnalysis(model: string, systemPrompt: string, userPrompt: string, response: string): number {
-  return Number(stmtInsertBoardAnalysis.run(model, systemPrompt, userPrompt, response).lastInsertRowid);
+export function insertBoardAnalysis(args: {
+  locale: "zh" | "en";
+  fixtureKey?: string | null;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  response: string;
+}): number {
+  return Number(
+    stmtInsertBoardAnalysis.run(args.locale, args.fixtureKey ?? null, args.model, args.systemPrompt, args.userPrompt, args.response).lastInsertRowid
+  );
 }
 
-export function listBoardAnalyses(limit = 5): AiBoardAnalysisRow[] {
-  return stmtListBoardAnalyses.all(Math.min(Math.max(limit, 1), 20)) as AiBoardAnalysisRow[];
+export function listBoardAnalyses(args: { locale?: "zh" | "en"; fixtureKey?: string | null; limit?: number } = {}): AiBoardAnalysisRow[] {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (args.locale) {
+    clauses.push("locale=?");
+    params.push(args.locale);
+  }
+  if ("fixtureKey" in args) {
+    if (args.fixtureKey) {
+      clauses.push("fixture_key=?");
+      params.push(args.fixtureKey);
+    } else {
+      clauses.push("fixture_key IS NULL");
+    }
+  }
+  const sql = `SELECT * FROM ai_board_analysis${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY ts DESC, id DESC LIMIT ?`;
+  params.push(Math.min(Math.max(args.limit ?? 5, 1), 20));
+  return db.prepare(sql).all(...params) as AiBoardAnalysisRow[];
 }
 
 export interface AlertRow {

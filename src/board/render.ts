@@ -530,7 +530,7 @@ function latestBettingSummary(locale: Locale, verdict: BoardBettingVerdict | nul
     .map((pick) => `<span class="chip ok">${esc(pick.outcome.toUpperCase())} <b>${pct(pick.estimated_probability)}</b></span>`)
     .join("");
   return (
-    `<p class="hero-sub">${esc(verdict.summary_zh)}</p>` +
+    `<p class="hero-sub">${esc(verdict.summary)}</p>` +
     `<div class="mini" style="margin-top:8px">${picks || `<span class="chip">${locale === "zh" ? "暂无正 EV 建议" : "No positive-EV picks"}</span>`}</div>` +
     `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
     `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`
@@ -546,7 +546,7 @@ function latestBettingCardSummary(locale: Locale, verdict: BoardBettingVerdict |
   }
   const picks = verdict.recommendations.length;
   return (
-    `<p class="hero-sub">${esc(verdict.summary_zh || (locale === "zh" ? "已有计划，打开查看详情。" : "A plan is available. Open it for details."))}</p>` +
+    `<p class="hero-sub">${esc(verdict.summary || (locale === "zh" ? "已有计划，打开查看详情。" : "A plan is available. Open it for details."))}</p>` +
     `<div class="mini" style="margin-top:8px"><span class="chip ok">${locale === "zh" ? "推荐" : "Picks"} <b>${picks}</b></span><span class="chip">${locale === "zh" ? "观察" : "Watch"} <b>${verdict.watchlist.length}</b></span><span class="chip">${locale === "zh" ? "避开" : "Avoid"} <b>${verdict.avoid.length}</b></span></div>` +
     `<div class="muted-line">${locale === "zh" ? "资金纪律" : "Bankroll"}: ${esc(verdict.bankroll_note || "-")}</div>` +
     `<div class="muted-line">${locale === "zh" ? "数据质量" : "Data quality"}: ${esc(verdict.data_quality || "-")}</div>`

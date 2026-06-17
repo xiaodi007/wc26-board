@@ -246,19 +246,26 @@ export function exportWalrusFeed(outDir = WALRUS_FEED_DIR, limit = 70): WalrusEx
     })
   );
 
-  const latestAi = latestBoardVerdict();
+  const latestAiEn = latestBoardVerdict("en", null);
+  const latestAiZh = latestBoardVerdict("zh", null);
+  const publicAi = (latestAi: ReturnType<typeof latestBoardVerdict>) =>
+    latestAi
+      ? {
+          id: latestAi.row.id,
+          ts: latestAi.row.ts,
+          locale: latestAi.row.locale,
+          fixture_key: latestAi.row.fixture_key,
+          model: latestAi.row.model,
+          verdict: latestAi.verdict,
+        }
+      : null;
   artifacts.push(
     writeJson(outDir, "ai-board-latest.json", {
       ...base,
       note: "Public unit-level AI betting reference only. User bankroll, stake amounts, API keys, and private prompts are never exported.",
-      latest_analysis: latestAi
-        ? {
-            id: latestAi.row.id,
-            ts: latestAi.row.ts,
-            model: latestAi.row.model,
-            verdict: latestAi.verdict,
-          }
-        : null,
+      latest_analysis: publicAi(latestAiEn),
+      latest_analysis_en: publicAi(latestAiEn),
+      latest_analysis_zh: publicAi(latestAiZh),
     })
   );
 
